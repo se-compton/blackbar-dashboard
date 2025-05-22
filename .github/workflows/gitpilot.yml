@@ -31,7 +31,14 @@ jobs:
           git config --global user.name "se-compton"
           git add .
           git commit -m "Auto update: \$(date '+%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
+- name: Pull before Push
+  run: |
+    git pull --rebase origin main || echo "Rebase failed or nothing to pull"
 
+- name: Push Changes
+  uses: ad-m/github-push-action@v0.6.0
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Push Changes
          run: |
            git pull --rebase origin main || echo "Rebase failed or nothing to pull"
