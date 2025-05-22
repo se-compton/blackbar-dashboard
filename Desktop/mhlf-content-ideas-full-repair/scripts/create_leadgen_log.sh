@@ -11,7 +11,7 @@ filename="leadgen-ads/${timestamp}-${label}.md"
 
 mkdir -p leadgen-ads
 
-cat <<EOF2 > "$filename"
+cat <<EOF > "$filename"
 # Lead Gen Conquest Tracker – $timestamp ($label)
 
 ### Branded Terms Monitored
@@ -23,9 +23,7 @@ cat <<EOF2 > "$filename"
 
 | Lead Gen Domain | Savannah | Macon | Augusta | Columbus | Notes |
 |-----------------|----------|-------|---------|----------|-------|
-| legalhelpnow.com |          |       |         |          |       |
-| justiceclaimsupport.com |   |       |         |          |       |
-
-EOF2
+EOF
 
 echo "Created $filename"
+
