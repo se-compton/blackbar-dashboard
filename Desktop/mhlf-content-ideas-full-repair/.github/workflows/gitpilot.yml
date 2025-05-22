@@ -9,8 +9,10 @@ jobs:
   commit-and-push:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repo
+      - name: Checkout Repo (Full History)
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
       - name: Set Timezone
         run: sudo timedatectl set-timezone America/New_York
@@ -33,8 +35,7 @@ jobs:
           git commit -m "Auto update: $(date '+%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
 
       - name: Pull Before Push
-        run: |
-          git pull --rebase origin main || echo "Nothing to pull"
+        run: git pull --rebase origin main || echo "No changes to pull"
 
       - name: Push Changes
         uses: ad-m/github-push-action@v0.6.0
