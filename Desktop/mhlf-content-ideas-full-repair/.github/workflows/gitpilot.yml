@@ -17,13 +17,14 @@ jobs:
 
       - name: Run Conquest Log Script
         run: |
-          chmod +x scripts/create_conquest_log.sh
-          ./scripts/create_conquest_log.sh || echo "Conquest script failed" >> error.log
+          chmod +x create_leadgen_log.sh
+	./create_leadgen_log.sh
+
 
       - name: Run Lead Gen Log Script
         run: |
-          chmod +x scripts/create_leadgen_log.sh
-          ./scripts/create_leadgen_log.sh || echo "Lead gen script failed" >> error.log
+	chmod +x scripts/create_conquest_log.sh
+	./scripts/create_conquest_log.sh
 
       - name: Commit Changes
         run: |
