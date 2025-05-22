@@ -1,0 +1,39 @@
+name: GitPilot Sync Log
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-logging:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set Timezone
+        run: sudo timedatectl set-timezone America/New_York
+
+      - name: Run Conquest Script
+        run: |
+          chmod +x scripts/create_conquest_log.sh
+          ./scripts/create_conquest_log.sh || echo "Conquest script failed" >> error.log
+
+      - name: Run Lead Gen Script
+        run: |
+          chmod +x scripts/create_leadgen_log.sh
+          ./scripts/create_leadgen_log.sh || echo "Lead gen script failed" >> error.log
+
+      - name: Commit New Logs
+        run: |
+          git config --global user.email "se-compton@users.noreply.github.com"
+          git config --global user.name "se-compton"
+          git add .
+          git commit -m "Auto log update: $(date '+%Y-%m-%d %H:%M:%S')" || echo "No new changes"
+
+      - name: Push to Repo
+        uses: ad-m/github-push-action@v0.6.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
