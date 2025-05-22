@@ -1,4 +1,4 @@
-name: GitPilot Auto Commit
+chmod +x scripts/create_conquest_log.shname: GitPilot Auto Commit
 
 on:
   schedule:
