@@ -1,0 +1,39 @@
+name: GitPilot Auto Commit
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  commit-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Set Timezone
+        run: sudo timedatectl set-timezone America/New_York
+
+      - name: Run Conquest Log Script
+        run: |
+          chmod +x scripts/create_conquest_log.sh
+          ./scripts/create_conquest_log.sh || echo "Conquest script failed" >> error.log
+
+      - name: Run Lead Gen Log Script
+        run: |
+          chmod +x scripts/create_leadgen_log.sh
+          ./scripts/create_leadgen_log.sh || echo "Lead gen script failed" >> error.log
+
+      - name: Commit Changes
+        run: |
+          git config --global user.email "se-compton@users.noreply.github.com"
+          git config --global user.name "se-compton"
+          git add .
+          git commit -m "Auto update: $(date '+%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
+
+      - name: Push Changes
+        uses: ad-m/github-push-action@v0.6.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
