@@ -1,4 +1,4 @@
-name: GitPilot Auto Commit
+name: GitPilot Log Collector
 
 on:
   schedule:
@@ -6,39 +6,29 @@ on:
   workflow_dispatch:
 
 jobs:
-  commit-and-push:
+  log-and-archive:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
+      - name: Checkout repo (read-only)
+        uses: actions/checkout@v3
 
-      - name: Set Timezone
+      - name: Set timezone
         run: sudo timedatectl set-timezone America/New_York
 
-      - name: Run Conquest Log Script
+      - name: Run conquest log script
         run: |
           chmod +x scripts/create_conquest_log.sh
-          ./scripts/create_conquest_log.sh || echo "Conquest script failed" >> error.log
+          ./scripts/create_conquest_log.sh
 
-      - name: Run Lead Gen Log Script
+      - name: Run lead gen log script
         run: |
           chmod +x scripts/create_leadgen_log.sh
-          ./scripts/create_leadgen_log.sh || echo "Lead gen script failed" >> error.log
+          ./scripts/create_leadgen_log.sh
 
-      - name: Commit Changes
-        run: |
-          git config --global user.email "se-compton@users.noreply.github.com"
-          git config --global user.name "se-compton"
-          git add .
-          git commit -m "Auto update: $(date '+%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
-
-      - name: Pull latest changes
-        run: |
-          git fetch origin
-          git pull origin master || echo "Nothing new to pull or pull failed"
-
-      - name: Push changes
-        uses: ad-m/github-push-action@v0.6.0
+      - name: Upload log artifacts
+        uses: actions/upload-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          branch: master
+          name: marketing-logs
+          path: |
+            conquested-ads/
+            leadgen-ads/
