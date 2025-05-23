@@ -1,4 +1,4 @@
-name: GitPilot Log Collector
+name: GitPilot Auto Commit (Rebase + Debug)
 
 on:
   schedule:
@@ -6,29 +6,49 @@ on:
   workflow_dispatch:
 
 jobs:
-  log-and-archive:
+  commit-and-push:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo (read-only)
+      - name: Checkout Repo (Full History)
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
-      - name: Set timezone
+      - name: Set Timezone
         run: sudo timedatectl set-timezone America/New_York
 
-      - name: Run conquest log script
+      - name: Pull Before Push
+        run: |
+          git fetch origin
+          git rebase origin/main || git rebase --abort
+
+      - name: Run Conquest Log Script
         run: |
           chmod +x scripts/create_conquest_log.sh
-          ./scripts/create_conquest_log.sh
+          ./scripts/create_conquest_log.sh || echo "Conquest script failed" >> error.log
 
-      - name: Run lead gen log script
+      - name: Run Lead Gen Log Script
         run: |
           chmod +x scripts/create_leadgen_log.sh
-          ./scripts/create_leadgen_log.sh
+          ./scripts/create_leadgen_log.sh || echo "Lead gen script failed" >> error.log
 
-      - name: Upload log artifacts
-        uses: actions/upload-artifact@v3
+      - name: Commit Changes
+        run: |
+          git config --global user.email "se-compton@users.noreply.github.com"
+          git config --global user.name "se-compton"
+          git add .
+          git commit -m "Auto update: $(date '+%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
+
+      - name: Push Changes
+        uses: ad-m/github-push-action@v0.6.0
         with:
-          name: marketing-logs
-          path: |
-            conquested-ads/
-            leadgen-ads/
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: main
+
+      - name: Display error.log if it exists
+        if: failure()
+        run: |
+          if [[ -f error.log ]]; then
+            echo "Contents of error.log:"
+            cat error.log
+          fi
