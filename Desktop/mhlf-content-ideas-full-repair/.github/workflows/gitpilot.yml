@@ -1,4 +1,4 @@
-name: GitPilot Auto Commit (Rebase + Debug)
+name: GitPilot Auto Commit (Final Custom Rebase Fix)
 
 on:
   schedule:
@@ -19,8 +19,7 @@ jobs:
 
       - name: Pull Before Push
         run: |
-          git fetch origin
-          git rebase origin/main || git rebase --abort
+          git pull --rebase origin main || git fetch origin && git rebase origin/main || echo "Rebase failed, resolve conflicts manually"
 
       - name: Run Conquest Log Script
         run: |
