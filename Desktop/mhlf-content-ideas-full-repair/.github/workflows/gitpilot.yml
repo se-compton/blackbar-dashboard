@@ -38,8 +38,9 @@ jobs:
           name: log-archive
           path: logs_bundle.zip
 
-# Optional step: if future Google Drive integration is enabled via secret
-# - name: Upload to Google Drive (requires rclone & secrets.GDRIVE_REMOTE)
+# Optional future use:
+# - name: Upload to Google Drive (via rclone)
+#   if: ${{ secrets.GDRIVE_REMOTE }}
 #   run: |
 #     curl https://rclone.org/install.sh | sudo bash
 #     echo "$GDRIVE_CONFIG" > ~/.config/rclone/rclone.conf
