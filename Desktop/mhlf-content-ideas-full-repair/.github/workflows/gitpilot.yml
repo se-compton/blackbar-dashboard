@@ -1,4 +1,4 @@
-name: GitPilot Artifact-Only Log Capture
+name: GitPilot Zip + Optional Google Upload
 
 on:
   schedule:
@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  archive-logs:
+  log-and-deliver:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout Repo
         uses: actions/checkout@v3
 
       - name: Set Timezone
@@ -25,16 +25,22 @@ jobs:
           chmod +x scripts/create_leadgen_log.sh
           ./scripts/create_leadgen_log.sh
 
-      - name: Archive Conquested Ads
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: conquested-ads
-          path: conquested-ads/
+      - name: Zip All Logs
+        run: |
+          mkdir -p logs_out
+          cp -r conquested-ads logs_out/ || echo "No conquest logs"
+          cp -r leadgen-ads logs_out/ || echo "No leadgen logs"
+          zip -r logs_bundle.zip logs_out/
 
-      - name: Archive Lead Gen Ads
-        if: always()
+      - name: Upload Logs as Artifact
         uses: actions/upload-artifact@v3
         with:
-          name: leadgen-ads
-          path: leadgen-ads/
+          name: log-archive
+          path: logs_bundle.zip
+
+# Optional step: if future Google Drive integration is enabled via secret
+# - name: Upload to Google Drive (requires rclone & secrets.GDRIVE_REMOTE)
+#   run: |
+#     curl https://rclone.org/install.sh | sudo bash
+#     echo "$GDRIVE_CONFIG" > ~/.config/rclone/rclone.conf
+#     rclone copy logs_bundle.zip ${{ secrets.GDRIVE_REMOTE }}:MHLFLogs/
