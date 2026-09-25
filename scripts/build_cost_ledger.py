@@ -162,16 +162,18 @@ def main(data_dir, out_path, as_of):
     ws.append([])
     ws.append(hdr)
     style_header(ws, 4, len(hdr))
+    n_last = max(len(cases) + 1, 2)
     groups = ["Settled", "Rejected", "Terminated", "Referred Out", "Closed - no resolution recorded"]
     for i, g in enumerate(groups):
         r = 5 + i
         ws.cell(r, 1, g)
-        ws.cell(r, 2, f'=COUNTIFS(Cases!$D:$D,$A{r})')
-        ws.cell(r, 3, f'=COUNTIFS(Cases!$D:$D,$A{r},Cases!$N:$N,">0")')
-        ws.cell(r, 4, f'=SUMIFS(Cases!$L:$L,Cases!$D:$D,$A{r})')
-        ws.cell(r, 5, f'=SUMIFS(Cases!$M:$M,Cases!$D:$D,$A{r})')
+        rng = lambda col: f"Cases!${col}$2:${col}${n_last}"
+        ws.cell(r, 2, f'=COUNTIFS({rng("D")},$A{r})')
+        ws.cell(r, 3, f'=COUNTIFS({rng("D")},$A{r},{rng("P")},">0")')
+        ws.cell(r, 4, f'=SUMIFS({rng("L")},{rng("D")},$A{r})')
+        ws.cell(r, 5, f'=SUMIFS({rng("M")},{rng("D")},$A{r})')
         ws.cell(r, 6, f'=D{r}-E{r}')
-        ws.cell(r, 7, f'=SUMIFS(Cases!$Q:$Q,Cases!$D:$D,$A{r})')
+        ws.cell(r, 7, f'=SUMIFS({rng("Q")},{rng("D")},$A{r})')
         ws.cell(r, 8, f'=F{r}-G{r}')
     tr = 5 + len(groups)
     ws.cell(tr, 1, "Total")
