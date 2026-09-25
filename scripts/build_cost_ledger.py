@@ -129,7 +129,7 @@ def main(data_dir, out_path, as_of):
                              status=p.get("status"), amount=amt, toqb=None, qbupd=None, counted=not void))
         for d in r.get("disb") or []:
             void = (d.get("status") or "") == "Voided"
-            rows.append(dict(src="Disbursal", kind="Recovery / close-out", date=d10(d.get("checkdate")) or d10(d.get("created")),
+            rows.append(dict(src="Disbursal", kind="Due-to-Firm disbursal", date=d10(d.get("checkdate")) or d10(d.get("created")),
                              payee="Michael G. Hostilo, LLC", memo=d.get("memo"), ref=d.get("checknumber"), method=d.get("type"),
                              status=d.get("status"), amount=num(d.get("amountpaid")) or num(d.get("amountdue")),
                              toqb=None, qbupd=None, counted=not void))
@@ -157,8 +157,8 @@ def main(data_dir, out_path, as_of):
     ws["A1"].font = Font(name=FONT, size=14, bold=True)
     ws["A2"] = f"Closed cases with a disposition date from {SCOPE_START} through {as_of}. Source: Filevine org 5676, Personal Injury project type."
     ws["A2"].font = Font(name=FONT, size=10, italic=True)
-    hdr = ["Disposition", "Cases", "Cases w/ Expenses", "FV Expenses Advanced", "FV Expense Recoveries / Close-outs",
-           "FV Net (Advanced - Recovered)", "QB Cost Account Total", "Variance (FV Net - QB)"]
+    hdr = ["Disposition", "Cases", "Cases w/ FV Cost Activity", "FV Expenses Logged (Requests + Postage)",
+           "FV Due-to-Firm Expense Disbursals", "Logged Not Yet Disbursed", "QB Cost Account Total", "Variance (Disbursed - QB)"]
     ws.append([])
     ws.append(hdr)
     style_header(ws, 4, len(hdr))
@@ -174,7 +174,7 @@ def main(data_dir, out_path, as_of):
         ws.cell(r, 5, f'=SUMIFS({rng("M")},{rng("D")},$A{r})')
         ws.cell(r, 6, f'=D{r}-E{r}')
         ws.cell(r, 7, f'=SUMIFS({rng("Q")},{rng("D")},$A{r})')
-        ws.cell(r, 8, f'=F{r}-G{r}')
+        ws.cell(r, 8, f'=E{r}-G{r}')
     tr = 5 + len(groups)
     ws.cell(tr, 1, "Total")
     for c in range(2, 9):
@@ -188,15 +188,15 @@ def main(data_dir, out_path, as_of):
                 cell.number_format = MONEY
     notes = [
         "How to read this workbook",
-        "Cases tab: one row per closed case. Yellow columns Q-S are for the QuickBooks figures you will add; Variance fills in automatically.",
+        "Cases tab: one row per closed case. Yellow columns Q-S are for the QuickBooks figures; Variance fills in automatically.",
         "Ledger tab: one row per Filevine transaction touching the cost account, for line-by-line tie-out to QuickBooks.",
-        "  - Expense Request = case cost advanced from the cost account (checks and BOA 7818 card). Voided items are listed but excluded from totals.",
+        "  - Expense Request = case cost paid from the cost account and logged in Filevine (checks and BOA 7818 card). Voided items are listed but excluded from totals.",
         "  - Postage = postage logged in the Postage Only section.",
-        "  - Disbursal = 'Due to Firm (Expenses/Postage)' checks. On settled cases this is costs reimbursed from settlement; on rejected/fired cases it is the 'FRD/REJ Case Exp' close-out.",
+        "  - Disbursal = 'Due to Firm (Expenses/Postage)' check. Settled cases: case costs reimbursed to the firm from settlement. Rejected/fired cases: the 'FRD/REJ Case Exp' close-out of the cost balance.",
+        "Many case costs are entered directly in QuickBooks and never logged in Filevine, so the Due-to-Firm disbursal (not the logged expenses) is the figure expected to tie to the QB cost account for each case.",
         "Disposition logic: Settled if any settlement amount is recorded in Case Summary; otherwise Resolution Type (Rejected, Referral-Rejected, Fired, Lost); otherwise the case phase.",
         "Disposition date: settlement date, rejected/fired date, or the date the case entered its current phase (archive date) when neither is recorded.",
-        "'FV QuickBooks Case Costs' is the figure Filevine last synced from QuickBooks (Final Costs & Fees section), available on settled cases only.",
-        "Cases whose Filevine entry is incomplete are flagged in the Notes column of the Cases tab.",
+        "'FV QuickBooks Case Costs (synced)' is the figure Filevine last pulled from QuickBooks (Final Costs & Fees section); settled cases only.",
     ]
     for i, n in enumerate(notes):
         c = ws.cell(tr + 2 + i, 1, n)
@@ -209,15 +209,15 @@ def main(data_dir, out_path, as_of):
     wc = wb.create_sheet("Cases")
     chdr = ["Filevine Project ID", "Case Name", "Client", "Disposition", "Disposition Detail", "Disposition Date",
             "Current FV Phase", "Phase Date", "Settlement Amount", "Rejection / Fire Reason", "Requested By",
-            "FV Expenses Advanced", "FV Recoveries / Close-outs", "FV Net Expense", "FV QuickBooks Case Costs (synced)",
-            "FV Transactions", "QB Cost Account Total", "QB Match Status", "QB Notes", "Variance (FV Net - QB)", "Notes", "Filevine Link"]
+            "FV Expenses Logged", "FV Due-to-Firm Expense Disbursals", "Logged Not Yet Disbursed", "FV QuickBooks Case Costs (synced)",
+            "FV Transactions", "QB Cost Account Total", "QB Match Status", "QB Notes", "Variance (Disbursed - QB)", "Notes", "Filevine Link"]
     wc.append(chdr)
     style_header(wc, 1, len(chdr))
     for i, c in enumerate(cases):
         r = i + 2
         wc.append([c["pid"], c["name"], c["client"], c["group"], c["detail"], c["ddate"], c["phase"], c["phase_date"],
                    c["settled"] or None, c["reason"], c["who"], c["adv"], c["rec"], f"=L{r}-M{r}", c["fvqb"], c["ntx"],
-                   None, None, None, f'=IF(Q{r}="","",N{r}-Q{r})', c["errors"] or None, FV_URL.format(c["pid"])])
+                   None, None, None, f'=IF(Q{r}="","",M{r}-Q{r})', c["errors"] or None, FV_URL.format(c["pid"])])
     last = len(cases) + 1
     for row in wc.iter_rows(min_row=2, max_row=last, max_col=len(chdr)):
         for cell in row:
@@ -271,7 +271,7 @@ def main(data_dir, out_path, as_of):
     wg.append(["Candidate cases not returned by the pull", len(missing)])
     wg.append(["Cases with Filevine read errors", sum(1 for c in cases if c["errors"])])
     wg.append(["Settled cases with no FV expense entries", sum(1 for c in cases if c["group"] == "Settled" and c["ntx"] == 0)])
-    wg.append(["Cases with expenses advanced but no recovery / close-out logged",
+    wg.append(["Cases with FV expenses logged but no Due-to-Firm expense disbursal",
                sum(1 for c in cases if c["adv"] > 0 and c["rec"] == 0)])
     if missing:
         wg.append([])
@@ -282,6 +282,7 @@ def main(data_dir, out_path, as_of):
     wg.column_dimensions["A"].width = 70
     wg.column_dimensions["B"].width = 40
 
+    wb.calculation.fullCalcOnLoad = True
     wb.save(out_path)
     print(json.dumps(dict(cases=len(cases), txns=len(txns), pulled=len(pulled), missing=len(missing),
                           out_of_scope=dict(out_of_scope), by_group=dict(Counter(c["group"] for c in cases)))))
