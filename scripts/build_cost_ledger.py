@@ -101,11 +101,14 @@ def main(data_dir, out_path, as_of):
                 r = json.loads(line)
                 pulled[int(r["projectId"])] = r
 
-    cases, txns, out_of_scope, missing = [], [], Counter(), []
+    cases, txns, out_of_scope, missing, screened = [], [], Counter(), [], []
     for pid, case in cands.items():
         r = pulled.get(pid)
         if r is None:
             missing.append(pid)
+            continue
+        if r.get("screen") == "no_cost_activity":
+            screened.append(case)
             continue
         cs = r.get("cs") or {}
         group, detail, ddate, settled_amt = disposition(case, cs)
@@ -190,6 +193,7 @@ def main(data_dir, out_path, as_of):
         "How to read this workbook",
         "Cases tab: one row per closed case. Yellow columns Q-S are for the QuickBooks figures; Variance fills in automatically.",
         "Ledger tab: one row per Filevine transaction touching the cost account, for line-by-line tie-out to QuickBooks.",
+        "All Closed Cases tab: every closed case in scope, including archived cases with no Filevine cost activity, so any QuickBooks entry can be traced to a case.",
         "  - Expense Request = case cost paid from the cost account and logged in Filevine (checks and BOA 7818 card). Voided items are listed but excluded from totals.",
         "  - Postage = postage logged in the Postage Only section.",
         "  - Disbursal = 'Due to Firm (Expenses/Postage)' check. Settled cases: case costs reimbursed to the firm from settlement. Rejected/fired cases: the 'FRD/REJ Case Exp' close-out of the cost balance.",
@@ -260,6 +264,36 @@ def main(data_dir, out_path, as_of):
     wl.freeze_panes = "C2"
     add_table(wl, "LedgerTbl", 1, lastl, len(lhdr))
 
+    # ---- All Closed Cases tab (lookup list for QB entries on any case) ----
+    wa = wb.create_sheet("All Closed Cases")
+    ahdr = ["Filevine Project ID", "Case Name", "Client", "Current FV Phase", "Phase Date (archive / close)",
+            "FV Cost Activity", "Disposition (if pulled)", "Filevine Link"]
+    wa.append(ahdr)
+    style_header(wa, 1, len(ahdr))
+    by_pid = {c["pid"]: c for c in cases}
+    screened_ids = {c["projectId"] for c in screened}
+    all_rows = []
+    for pid, case in cands.items():
+        if pid in by_pid:
+            act, disp = "Yes - see Cases tab", by_pid[pid]["group"]
+        elif pid in screened_ids:
+            act, disp = "None in Filevine", None
+        elif pid in pulled:
+            act, disp = "Out of date scope", None
+        else:
+            act, disp = "Not pulled", None
+        all_rows.append([pid, case["projectName"], case.get("clientName") or "", case["phase"], case["phaseDate"],
+                         act, disp, FV_URL.format(pid)])
+    for row in sorted(all_rows, key=lambda x: (x[1] or "").lower()):
+        wa.append(row)
+    for row in wa.iter_rows(min_row=2, max_col=len(ahdr)):
+        for cell in row:
+            cell.font = Font(name=FONT, size=10)
+    for i, w in enumerate([12, 40, 26, 24, 14, 20, 16, 42]):
+        wa.column_dimensions[get_column_letter(i + 1)].width = w
+    wa.freeze_panes = "C2"
+    add_table(wa, "AllCasesTbl", 1, len(all_rows) + 1, len(ahdr))
+
     # ---- Data Gaps tab -----------------------------------------------------
     wg = wb.create_sheet("Data Gaps")
     wg.append(["Item", "Count / Detail"])
@@ -268,6 +302,7 @@ def main(data_dir, out_path, as_of):
     wg.append(["Cases in scope (disposition date on or after " + SCOPE_START + ")", len(cases)])
     for g, n in sorted(out_of_scope.items()):
         wg.append([f"Excluded: {g} with disposition date before {SCOPE_START}", n])
+    wg.append(["Archived cases with no Filevine cost activity (listed on All Closed Cases tab)", len(screened)])
     wg.append(["Candidate cases not returned by the pull", len(missing)])
     wg.append(["Cases with Filevine read errors", sum(1 for c in cases if c["errors"])])
     wg.append(["Settled cases with no FV expense entries", sum(1 for c in cases if c["group"] == "Settled" and c["ntx"] == 0)])
