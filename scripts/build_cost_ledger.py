@@ -161,7 +161,7 @@ def main(data_dir, out_path, as_of):
     ws["A2"] = f"Closed cases with a disposition date from {SCOPE_START} through {as_of}. Source: Filevine org 5676, Personal Injury project type."
     ws["A2"].font = Font(name=FONT, size=10, italic=True)
     hdr = ["Disposition", "Cases", "Cases w/ FV Cost Activity", "FV Expenses Logged (Requests + Postage)",
-           "FV Due-to-Firm Expense Disbursals", "Logged Not Yet Disbursed", "QB Cost Account Total", "Variance (Disbursed - QB)"]
+           "FV Due-to-Firm Expense Disbursals", "Logged minus Disbursed", "QB Cost Account Total", "Variance (Disbursed - QB)"]
     ws.append([])
     ws.append(hdr)
     style_header(ws, 4, len(hdr))
@@ -177,7 +177,7 @@ def main(data_dir, out_path, as_of):
         ws.cell(r, 5, f'=SUMIFS({rng("M")},{rng("D")},$A{r})')
         ws.cell(r, 6, f'=D{r}-E{r}')
         ws.cell(r, 7, f'=SUMIFS({rng("Q")},{rng("D")},$A{r})')
-        ws.cell(r, 8, f'=E{r}-G{r}')
+        ws.cell(r, 8, f'=IF(G{r}=0,"",E{r}-G{r})')
     tr = 5 + len(groups)
     ws.cell(tr, 1, "Total")
     for c in range(2, 9):
@@ -213,7 +213,7 @@ def main(data_dir, out_path, as_of):
     wc = wb.create_sheet("Cases")
     chdr = ["Filevine Project ID", "Case Name", "Client", "Disposition", "Disposition Detail", "Disposition Date",
             "Current FV Phase", "Phase Date", "Settlement Amount", "Rejection / Fire Reason", "Requested By",
-            "FV Expenses Logged", "FV Due-to-Firm Expense Disbursals", "Logged Not Yet Disbursed", "FV QuickBooks Case Costs (synced)",
+            "FV Expenses Logged", "FV Due-to-Firm Expense Disbursals", "Logged minus Disbursed", "FV QuickBooks Case Costs (synced)",
             "FV Transactions", "QB Cost Account Total", "QB Match Status", "QB Notes", "Variance (Disbursed - QB)", "Notes", "Filevine Link"]
     wc.append(chdr)
     style_header(wc, 1, len(chdr))
