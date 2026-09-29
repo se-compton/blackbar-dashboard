@@ -38,6 +38,7 @@ Master Bonus workbook (Employee ID, Amount) plus a name column.
 - Tonya Lee: fixed 20% / 12 every month.
 - Investigators (Rivers, McGahee, Z. Willis, Lovett, J. Mason): flat $500.
 - Excluded: Mike Hostilo (owner), Sean Compton (declined). Hodges is quarterly only.
+- Olivia Warnock's bonus is paid on a 1099 outside payroll, so it never shows on the register.
 - LIT pool and quarterly management pay only in Jan, Apr, Jul, Oct.
 - Market attorney fee split: 10% flat pre-lit, net of draw offset, paid under ATTYF.
 
