@@ -128,9 +128,15 @@ def native(v):
 
 def export_config(c):
     print("Config ...")
-    save("me.json", c.get("/users/me"))
-    save("users.json", list(c.paged("/users")))
-    save("chaintypes.json", list(c.paged("/chaintypes")))
+    for name, fetch in [
+        ("me.json", lambda: c.get("/users/me")),
+        ("users.json", lambda: list(c.paged("/users"))),
+        ("chaintypes.json", lambda: list(c.paged("/chaintypes"))),
+    ]:
+        try:
+            save(name, fetch())
+        except urllib.error.HTTPError as e:
+            print(f"  skipped {name}: HTTP {e.code}")
     types = list(c.paged("/projecttypes"))
     for t in types:
         tid = native(t["projectTypeId"])
@@ -149,11 +155,22 @@ def export_config(c):
     save("projecttypes.json", types)
 
 
+# Only these terms survive from a project name, so a client name can never leak
+# into the de-identified exports (hyphenated surnames split into odd segments).
+CASE_TERMS = {
+    "mva": "MVA", "minor": "Minor", "wc": "WC", "premise": "Premise", "premises": "Premise",
+    "dog bite": "Dog Bite", "med mal": "Med Mal", "medmal": "Med Mal", "deceased": "Deceased",
+    "product liability": "Product Liability", "nursing home": "Nursing Home", "ssdi": "SSDI",
+    "sav": "Sav", "aug": "Aug", "mac": "Mac", "macon": "Mac", "col": "Col", "beau": "Beau",
+    "aik": "Aik", "ala": "Ala", "alb": "Alb", "albany": "Alb", "atl": "Atl", "chas": "Chas",
+    "fl": "FL", "sc": "SC", "tn": "TN", "nc": "NC", "ky": "KY", "al": "AL",
+}
+
+
 def case_type(project_name):
-    """'Jane Doe - Minor - MVA - 9/15/2024' -> 'Minor/MVA'. Drops the client name and dates."""
-    parts = [p.strip() for p in re.split(r"\s+-\s+", project_name or "")]
-    keep = [p for p in parts[1:] if p and not re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", p)]
-    return "/".join(keep)
+    """'Jane Doe - Minor - MVA - 9/15/2024' -> 'Minor/MVA'. Keeps only known terms."""
+    parts = [p.strip().lower() for p in re.split(r"\s*-\s*", project_name or "")]
+    return "/".join(CASE_TERMS[p] for p in parts[1:] if p in CASE_TERMS)
 
 
 def export_projects(c, full=False):
