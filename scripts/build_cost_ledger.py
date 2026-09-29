@@ -15,6 +15,7 @@ import glob
 import json
 import os
 import sys
+from datetime import date
 from collections import Counter, defaultdict
 
 from openpyxl import Workbook
@@ -24,7 +25,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from qb_match import assign_cases, load_qb, match_transactions  # noqa: E402
+from qb_match import assign_direct, load_qb, match_transactions  # noqa: E402
 
 SCOPE_START = "2024-01-01"
 FV_URL = "https://hostilolaw.filevineapp.com/#/project/{}"
@@ -144,7 +145,8 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
                              toqb=None, qbupd=None, counted=not void))
 
         adv = sum(x["amount"] for x in rows if x["kind"] == "Advance" and x["counted"])
-        rec = sum(x["amount"] for x in rows if x["kind"] != "Advance" and x["counted"])
+        # Postage disbursals never post to the QB cost account, so only Due to Firm (Expenses) counts here.
+        rec = sum(x["amount"] for x in rows if x["kind"] != "Advance" and x["counted"] and "Postage" not in str(x["method"]))
         fc = r.get("fc") or {}
         cases.append(dict(pid=pid, name=case["projectName"], client=case.get("clientName") or "", group=group, detail=detail,
                           ddate=ddate, phase=case["phase"], phase_date=case["phaseDate"], settled=settled_amt,
@@ -158,13 +160,21 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
     cases.sort(key=lambda c: (c["group"], c["ddate"] or "", c["pid"]))
     txns.sort(key=lambda t: (t["group"], t["pid"], t["date"] or ""))
 
-    qb_lines, qb_by_case = None, defaultdict(lambda: [0.0, 0.0])
+    qb_lines, qb_by_case, qb_status = None, defaultdict(lambda: [0.0, 0.0]), {}
     if qb_path:
-        qb_lines = assign_cases(load_qb(qb_path, flip=qb_flip), cands)
+        qb_lines = assign_direct(load_qb(qb_path, flip=qb_flip), cands)
         match_transactions(txns, qb_lines)
         for ln in qb_lines:
             if ln["pid"]:
                 qb_by_case[ln["pid"]][0 if ln["amount"] > 0 else 1] += abs(ln["amount"])
+        per = defaultdict(lambda: [0, 0])
+        for t in txns:
+            if t.get("qb_match") in ("Y", "N"):
+                per[t["pid"]][0] += 1
+                per[t["pid"]][1] += t["qb_match"] == "Y"
+        for pid, (n, y) in per.items():
+            qb_status[pid] = ("All FV items found in QB" if y == n else
+                              "No FV items found in QB" if y == 0 else f"Partial: {y} of {n} FV items found in QB")
 
     wb = Workbook()
     # ---- Summary tab -------------------------------------------------------
@@ -175,8 +185,8 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
     ws["A2"] = f"Closed cases with a disposition date from {SCOPE_START} through {as_of}. Source: Filevine org 5676, Personal Injury project type."
     ws["A2"].font = Font(name=FONT, size=10, italic=True)
     hdr = ["Disposition", "Cases", "Cases w/ FV Cost Activity", "FV Expenses Logged (Requests + Postage)",
-           "FV Due-to-Firm Expense Disbursals", "QB Costs Posted", "QB Reimbursed / Written Off",
-           "QB Open Balance", "Variance (FV Disbursed - QB Credits)", "Cases w/ Open QB Balance"]
+           "FV Due-to-Firm Expense Disbursals", "QB Costs Matched to Case", "QB Credits Matched to Case",
+           "Net of Matched QB Lines", "Variance (FV Disbursed - QB Credits Matched)", "Cases w/ FV Items Not Found in QB"]
     ws.append([])
     ws.append(hdr)
     style_header(ws, 4, len(hdr))
@@ -194,7 +204,7 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
         ws.cell(r, 7, f'=SUMIFS({rng("R")},{rng("D")},$A{r})')
         ws.cell(r, 8, f'=F{r}-G{r}')
         ws.cell(r, 9, f'=IF(AND(F{r}=0,G{r}=0),"",E{r}-G{r})')
-        ws.cell(r, 10, f'=COUNTIFS({rng("D")},$A{r},{rng("U")},"Open balance in QB")')
+        ws.cell(r, 10, f'=COUNTIFS({rng("D")},$A{r},{rng("U")},"<>All FV items found in QB",{rng("U")},"<>")')
     tr = 5 + len(groups)
     ws.cell(tr, 1, "Total")
     for c in range(2, 11):
@@ -208,14 +218,15 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
                 cell.number_format = MONEY
     notes = [
         "How to read this workbook",
-        "Cases tab: one row per closed case. Yellow columns Q, R and V hold the QuickBooks figures (filled automatically when a QB export is supplied); Open Balance, Variance and Match Status calculate from them.",
-        "  - A closed case should carry a zero cost-account balance in QB. 'Open balance in QB' means costs remain on the books for a case Filevine shows as closed.",
-        "  - Variance compares the Filevine Due-to-Firm expense disbursal with what QB credited to the cost account for the case.",
+        "Cases tab: one row per closed case. Columns Q-R hold the QB cost-account lines tied to the case; Match Status says whether each Filevine expense and Due-to-Firm disbursal was found in QB.",
+        "  - The QB Advanced Client Costs account does not record the case on each line (Name is the vendor), so QB lines are tied to cases through the Filevine transactions: check number, or amount and date.",
+        "  - Variance compares the Filevine Due-to-Firm expense disbursal with the QB deposits (credits) matched to the case. A positive variance means Filevine shows a reimbursement that was not found in QB.",
+        "  - QB lines that could not be tied to any Filevine transaction are listed on the QB Detail tab as 'Not traceable to a Filevine case' and totaled on the QB Not Traceable tab.",
         "Ledger tab: one row per Filevine transaction touching the cost account, for line-by-line tie-out to QuickBooks.",
         "All Closed Cases tab: every closed case in scope, including archived cases with no Filevine cost activity, so any QuickBooks entry can be traced to a case.",
         "  - Expense Request = case cost paid from the cost account and logged in Filevine (checks and BOA 7818 card). Voided items are listed but excluded from totals.",
         "  - Postage = postage logged in the Postage Only section.",
-        "  - Disbursal = 'Due to Firm (Expenses/Postage)' check. Settled cases: case costs reimbursed to the firm from settlement. Rejected/fired cases: the 'FRD/REJ Case Exp' close-out of the cost balance.",
+        "  - Disbursal = 'Due to Firm (Expenses/Postage)' check. Only the Expenses disbursals are totaled; postage disbursals are listed on the Ledger but never post to the QB cost account. Settled cases: case costs reimbursed to the firm from settlement. Rejected/fired cases: the 'FRD/REJ Case Exp' close-out of the cost balance.",
         "Many case costs are entered directly in QuickBooks and never logged in Filevine, so the Due-to-Firm disbursal (not the logged expenses) is the figure expected to tie to the QB cost account for each case.",
         "Disposition logic: Settled if any settlement amount is recorded in Case Summary; otherwise Resolution Type (Rejected, Referral-Rejected, Fired, Lost); otherwise the case phase.",
         "Disposition date: settlement date, rejected/fired date, or the date the case entered its current phase (archive date) when neither is recorded.",
@@ -233,8 +244,8 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
     chdr = ["Filevine Project ID", "Case Name", "Client", "Disposition", "Disposition Detail", "Disposition Date",
             "Current FV Phase", "Phase Date", "Settlement Amount", "Rejection / Fire Reason", "Requested By",
             "FV Expenses Logged", "FV Due-to-Firm Expense Disbursals", "Logged minus Disbursed", "FV QuickBooks Case Costs (synced)",
-            "FV Transactions", "QB Costs Posted (debits)", "QB Reimbursed / Written Off (credits)", "QB Open Balance",
-            "Variance (FV Disbursed - QB Credits)", "QB Match Status", "QB Notes", "Notes", "Filevine Link"]
+            "FV Transactions", "QB Costs Matched to Case", "QB Credits Matched to Case", "Net of Matched QB Lines",
+            "Variance (FV Disbursed - QB Credits Matched)", "QB Match Status", "QB Notes", "Notes", "Filevine Link"]
     wc.append(chdr)
     style_header(wc, 1, len(chdr))
     for i, c in enumerate(cases):
@@ -243,6 +254,7 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
         wc.append([c["pid"], c["name"], c["client"], c["group"], c["detail"], c["ddate"], c["phase"], c["phase_date"],
                    c["settled"] or None, c["reason"], c["who"], c["adv"], c["rec"], f"=L{r}-M{r}", c["fvqb"], c["ntx"],
                    qd, qc, f'=IF(AND(Q{r}="",R{r}=""),"",N(Q{r})-N(R{r}))', f'=IF(AND(Q{r}="",R{r}=""),"",M{r}-N(R{r}))',
+                   qb_status.get(c["pid"], "") if qb_lines is not None else
                    f'=IF(AND(Q{r}="",R{r}=""),IF(M{r}>0,"Not in QB",""),IF(ABS(S{r})>=0.01,"Open balance in QB",IF(ABS(T{r})<0.01,"Matched","Variance")))',
                    None, c["errors"] or None, FV_URL.format(c["pid"])])
     last = len(cases) + 1
@@ -254,9 +266,9 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
             if cell.column in (17, 18, 22):
                 cell.fill = INPUT_FILL
                 cell.font = BLUE
-    wc["Q1"].comment = Comment("Total debits to the QB cost account for this case (costs advanced). Filled from the QB export, or enter manually.", "Ledger")
-    wc["R1"].comment = Comment("Total credits to the QB cost account for this case (reimbursed from settlement or written off). Filled from the QB export, or enter manually.", "Ledger")
-    wc["U1"].comment = Comment("Matched = QB balance is zero and QB credits equal the FV Due-to-Firm disbursal. Open balance in QB = costs still on the books for a closed case.", "Ledger")
+    wc["Q1"].comment = Comment("QB cost-account debits tied to this case through its Filevine expenses (check # or amount/date) or a project ID in the QB description.", "Ledger")
+    wc["R1"].comment = Comment("QB cost-account credits (Case Exp / FRD-REJ deposits) tied to this case through its Filevine Due-to-Firm disbursals.", "Ledger")
+    wc["U1"].comment = Comment("Share of this case's Filevine expenses and Due-to-Firm disbursals that were found in QB. Postage is not posted line-by-line in QB and is not counted.", "Ledger")
     widths = [12, 38, 24, 16, 30, 12, 24, 11, 14, 26, 11, 14, 14, 14, 14, 10, 14, 14, 14, 14, 20, 24, 24, 42]
     for i, w in enumerate(widths):
         wc.column_dimensions[get_column_letter(i + 1)].width = w
@@ -321,35 +333,81 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
 
     # ---- QB Detail tab (only when a QB export is supplied) -----------------
     if qb_lines is not None:
-        wq = wb.create_sheet("QB Detail")
-        qhdr = ["QB Date", "QB Type", "QB Num", "QB Name", "QB Memo", "QB Account", "Amount",
-                "Filevine Project ID", "Case Name", "How Identified", "Case Status", "Matched to FV Transaction"]
-        wq.append(qhdr)
-        style_header(wq, 1, len(qhdr))
         def case_status(pid):
             if not pid:
-                return "Unidentified - no closed case found"
+                return "Not traceable to a Filevine case"
             if pid in by_pid:
                 return f"In ledger ({by_pid[pid]['group']})"
             if pid in screened_ids:
                 return "Closed - no FV cost activity"
             if pid in pulled:
                 return "Closed - disposition before " + SCOPE_START
-            return "Closed - not yet pulled from Filevine"
-        for ln in sorted(qb_lines, key=lambda x: (x["pid"] or 0, x["date"])):
+            return "Case not in closed-case list"
+        scope_d = date.fromisoformat(SCOPE_START)
+        shown = [ln for ln in qb_lines if ln["date"] >= scope_d or ln["pid"]]
+        wq = wb.create_sheet("QB Detail")
+        qhdr = ["QB Date", "QB Type", "QB Num", "QB Name (vendor)", "QB Class", "QB Description", "QB Split", "Amount",
+                "Filevine Project ID", "Case Name", "How Tied", "Case Status", "Matched to FV Transaction"]
+        wq.append(qhdr)
+        style_header(wq, 1, len(qhdr))
+        for ln in sorted(shown, key=lambda x: x["date"]):
             pid = ln["pid"]
-            wq.append([ln["date"].isoformat(), ln["type"], ln["num"], ln["name"], ln["memo"], ln["account"], ln["amount"],
-                       pid, cands[pid]["projectName"] if pid else None, ln["how"], case_status(pid),
+            wq.append([ln["date"].isoformat(), ln["type"], ln["num"], ln["name"], ln["cls"], ln["memo"], ln["account"],
+                       ln["amount"], pid, cands[pid]["projectName"] if pid else None, ln["how"], case_status(pid),
                        "Y" if ln["fv_matched"] else "N"])
         for row in wq.iter_rows(min_row=2, max_col=len(qhdr)):
             for cell in row:
                 cell.font = Font(name=FONT, size=10)
-                if cell.column == 7:
+                if cell.column == 8:
                     cell.number_format = MONEY
-        for i, w in enumerate([11, 12, 10, 30, 40, 26, 12, 12, 38, 22, 30, 12]):
+        for i, w in enumerate([11, 12, 9, 30, 18, 34, 28, 11, 12, 34, 30, 28, 11]):
             wq.column_dimensions[get_column_letter(i + 1)].width = w
         wq.freeze_panes = "A2"
-        add_table(wq, "QBDetailTbl", 1, len(qb_lines) + 1, len(qhdr))
+        add_table(wq, "QBDetailTbl", 1, len(shown) + 1, len(qhdr))
+
+        # ---- QB Not Traceable tab: untied QB lines in scope, by year / type / vendor ----
+        wn = wb.create_sheet("QB Not Traceable")
+        agg = defaultdict(lambda: [0, 0.0])
+        for ln in qb_lines:
+            if ln["date"] >= scope_d and not ln["pid"]:
+                who = ln["name"] or (ln["memo"][:40] if ln["type"] == "Deposit" else "(no name)")
+                k = (ln["date"].year, ln["type"], who)
+                agg[k][0] += 1
+                agg[k][1] += ln["amount"]
+        nhdr = ["Year", "QB Type", "Vendor / Deposit Memo", "Lines", "Amount"]
+        wn.append(nhdr)
+        style_header(wn, 1, len(nhdr))
+        for (y, t, who), (n, amt) in sorted(agg.items(), key=lambda kv: (kv[0][0], -abs(kv[1][1]))):
+            wn.append([str(y), t, who, n, round(amt, 2)])
+        for row in wn.iter_rows(min_row=2, max_col=len(nhdr)):
+            for cell in row:
+                cell.font = Font(name=FONT, size=10)
+                if cell.column == 5:
+                    cell.number_format = MONEY
+        for i, w in enumerate([8, 18, 44, 8, 14]):
+            wn.column_dimensions[get_column_letter(i + 1)].width = w
+        wn.freeze_panes = "A2"
+        add_table(wn, "QBNotTraceTbl", 1, len(agg) + 1, len(nhdr))
+
+        # ---- QB control totals on the Summary tab ----
+        r0 = ws.max_row + 2
+        ws.cell(r0, 1, "QuickBooks control totals (Advanced Client Costs)").font = Font(name=FONT, size=10, bold=True)
+        insc = [ln for ln in qb_lines if ln["date"] >= scope_d]
+        ctl = [
+            ("QB account balance, all dates (ties to the QB report total)", sum(ln["amount"] for ln in qb_lines)),
+            (f"QB costs posted since {SCOPE_START}", sum(ln["amount"] for ln in insc if ln["amount"] > 0)),
+            (f"QB credits (reimbursed / written off) since {SCOPE_START}", -sum(ln["amount"] for ln in insc if ln["amount"] < 0)),
+            ("  of which costs tied to a closed Filevine case", sum(ln["amount"] for ln in insc if ln["amount"] > 0 and ln["pid"])),
+            ("  of which credits tied to a closed Filevine case", -sum(ln["amount"] for ln in insc if ln["amount"] < 0 and ln["pid"])),
+            ("  costs not traceable to a Filevine case", sum(ln["amount"] for ln in insc if ln["amount"] > 0 and not ln["pid"])),
+            ("  credits not traceable to a Filevine case", -sum(ln["amount"] for ln in insc if ln["amount"] < 0 and not ln["pid"])),
+        ]
+        for i, (label, val) in enumerate(ctl):
+            ws.cell(r0 + 1 + i, 1, label).font = Font(name=FONT, size=10)
+            c = ws.cell(r0 + 1 + i, 4, round(val, 2))
+            c.font = Font(name=FONT, size=10)
+            c.number_format = MONEY
+        ws.cell(r0 + 1 + len(ctl), 1, f"Source: {os.path.basename(qb_path)} (QuickBooks Transaction Detail by Account export).").font = Font(name=FONT, size=9, italic=True)
 
     # ---- Data Gaps tab -----------------------------------------------------
     wg = wb.create_sheet("Data Gaps")
@@ -366,14 +424,13 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
     wg.append(["Cases with FV expenses logged but no Due-to-Firm expense disbursal",
                sum(1 for c in cases if c["adv"] > 0 and c["rec"] == 0)])
     if qb_lines is not None:
-        qs = Counter(("Unidentified" if not ln["pid"] else
-                      "ledger" if ln["pid"] in by_pid else
-                      "screened" if ln["pid"] in screened_ids else "other") for ln in qb_lines)
-        wg.append(["QB lines loaded", len(qb_lines)])
+        wg.append(["QB lines loaded (all dates)", len(qb_lines)])
         wg.append(["QB lines matched to a Filevine transaction", sum(1 for ln in qb_lines if ln["fv_matched"])])
-        wg.append(["QB lines on closed cases with no Filevine cost activity", qs["screened"]])
-        wg.append(["QB lines not tied to any closed case (see QB Detail tab)", qs["Unidentified"]])
-        wg.append(["Filevine transactions with no matching QB line", sum(1 for t in txns if t.get("qb_match") == "N")])
+        wg.append(["QB lines tied by project ID in the description", sum(1 for ln in qb_lines if ln["pid"] and not ln["fv_matched"])])
+        wg.append(["Filevine expenses / disbursals found in QB", sum(1 for t in txns if t.get("qb_match") == "Y")])
+        wg.append(["Filevine expenses / disbursals NOT found in QB", sum(1 for t in txns if t.get("qb_match") == "N")])
+        wg.append(["QB lines since " + SCOPE_START + " not traceable to a Filevine case (see QB Not Traceable tab)",
+                   sum(1 for ln in qb_lines if ln["date"] >= date.fromisoformat(SCOPE_START) and not ln["pid"])])
     if missing:
         wg.append([])
         wg.append(["Missing Filevine Project IDs", ", ".join(str(m) for m in missing[:500])])

@@ -1,22 +1,26 @@
 """Load a QuickBooks cost-account export and match it to Filevine cases.
 
-Accepts a CSV or XLSX export such as "Transaction Detail by Account" or
-"Transaction List by Customer". The header row is found automatically; section
-header and total rows (no date) are skipped.
+Accepts a CSV or XLSX export such as "Transaction Detail by Account". The header
+row is found automatically; section header and total rows (no date) are skipped.
 
-Each QB line is assigned to a Filevine project by, in order:
-  1. a project ID in parentheses in the name or memo, e.g. "Crumley, Ashley (15032058)"
-     (the format the Filevine-to-QuickBooks sync writes),
-  2. any bare 7-8 digit number in the name or memo that is a known project ID,
-  3. a unique client-name match ("Last, First" or "First Last").
+The firm's Advanced Client Costs account does not carry the case on each line
+(Name is the vendor), so lines are tied to cases mainly through the Filevine
+transactions, which do carry the case:
+  1. Filevine expense check  -> QB Check with the same check number and amount
+  2. Filevine card expense   -> QB card Expense with the same amount within 7 days
+  3. Filevine Due-to-Firm expense disbursal -> QB Deposit (credit) with the same
+     amount within 21 days
+A QB line can also be tied directly when its name or description holds a
+Filevine project ID, e.g. "Gain Ford (10933334)" or "Falter, Lawrence {8330767}".
 
 Sign convention: positive amounts are costs posted to the cost account (debits),
 negative amounts are reimbursements or write-offs (credits). Pass flip=True if
 the export uses the opposite sign.
 """
+import bisect
 import csv
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from openpyxl import load_workbook
 
@@ -27,13 +31,14 @@ HEADER_ALIASES = {
     "name": ("name", "customer", "customer:job", "customer full name", "payee", "vendor", "customer/project",
              "project", "customer/job"),
     "memo": ("memo/description", "memo", "description", "line description"),
-    "account": ("account", "account full name", "split", "distribution account"),
+    "account": ("split", "account", "account full name", "distribution account"),
+    "cls": ("class", "class full name"),
     "amount": ("amount", "net amount"),
     "debit": ("debit",),
     "credit": ("credit",),
 }
-PID_PAREN = re.compile(r"\((\d{6,9})\)")
-PID_BARE = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")
+PID_PAT = re.compile(r"[\(\{](\d{7,8})[\)\}]")
+CARD_TYPES = ("expense", "credit card expense", "credit card credit")
 
 
 def _norm(s):
@@ -102,94 +107,121 @@ def load_qb(path, flip=False):
         amt = _money(get("amount"))
         if amt is None:
             dr, cr = _money(get("debit")) or 0.0, _money(get("credit")) or 0.0
-            if not dr and not cr:
-                continue
             amt = dr - cr
         if flip:
             amt = -amt
         lines.append(dict(date=d, type=str(get("type") or ""), num=str(get("num") or "").strip(),
                           name=str(get("name") or ""), memo=str(get("memo") or ""),
-                          account=str(get("account") or ""), amount=round(amt, 2)))
+                          account=str(get("account") or ""), cls=str(get("cls") or ""),
+                          amount=round(amt, 2), pid=None, how=None, fv_matched=False))
     return lines
 
 
-def _name_keys(name):
-    """Keys for matching a client name: 'last first' from either 'Last, First' or 'First Last'."""
-    s = re.sub(r"\(.*?\)", " ", str(name or ""))
-    s = re.split(r"\s+-\s+", s)[0]  # "Jane Doe - MVA - 1/1/2025" -> "Jane Doe"
-    s = re.sub(r"[^a-zA-Z, ]", " ", s).strip().lower()
-    if not s:
-        return set()
-    if "," in s:
-        last, first = [p.strip() for p in s.split(",", 1)]
-        firsts = first.split()
-        return {f"{last} {firsts[0]}"} if firsts and last else set()
-    parts = [p for p in s.split() if p not in ("jr", "sr", "ii", "iii", "iv", "minor")]
-    return {f"{parts[-1]} {parts[0]}"} if len(parts) >= 2 else set()
-
-
-def assign_cases(lines, cands):
-    """Set line['pid'] and line['how'] for each QB line. cands: {pid: candidate dict}."""
-    by_name = {}
-    for pid, c in cands.items():
-        for src in (c.get("clientName"), c.get("projectName")):
-            for k in _name_keys(src):
-                by_name.setdefault(k, set()).add(pid)
+def assign_direct(lines, cands):
+    """Tie QB lines that name a Filevine project ID in their name or description."""
     for ln in lines:
-        text = f"{ln['name']} {ln['memo']}"
-        pid, how = None, None
-        m = PID_PAREN.search(text)
-        if m and int(m.group(1)) in cands:
-            pid, how = int(m.group(1)), "Project ID in QB name/memo"
-        if pid is None:
-            for m in PID_BARE.finditer(text):
-                if int(m.group(1)) in cands:
-                    pid, how = int(m.group(1)), "Project ID in QB name/memo"
-                    break
-        if pid is None:
-            hits = set()
-            for k in _name_keys(ln["name"]) | _name_keys(ln["memo"].split(":")[0]):
-                hits |= by_name.get(k, set())
-            if len(hits) == 1:
-                pid, how = hits.pop(), "Client name match"
-            elif len(hits) > 1:
-                how = f"Ambiguous name ({len(hits)} cases)"
-        ln["pid"], ln["how"] = pid, how or "Unidentified"
+        for m in PID_PAT.finditer(f"{ln['name']} {ln['memo']}"):
+            if int(m.group(1)) in cands:
+                ln["pid"], ln["how"] = int(m.group(1)), "Project ID in QB name/description"
+                break
     return lines
 
 
-def match_transactions(fv_txns, qb_lines, days=10):
-    """Pair Filevine transactions with QB lines on the same case (same amount; same check # or close date).
+class _Pool:
+    """QB lines indexed by (kind, cents) and sorted by date for nearest-date lookups."""
 
-    Sets t['qb_match'] / t['qb_ref'] on FV transactions and ln['fv_matched'] on QB lines.
-    """
-    by_case = {}
-    for ln in qb_lines:
-        ln["fv_matched"] = False
-        if ln.get("pid"):
-            by_case.setdefault(ln["pid"], []).append(ln)
-    for t in fv_txns:
+    def __init__(self, lines, kind_of):
+        self.idx = {}
+        for ln in lines:
+            k = kind_of(ln)
+            if k:
+                self.idx.setdefault((k, round(abs(ln["amount"]) * 100)), []).append(ln)
+        self.dates = {}
+        for key, v in self.idx.items():
+            v.sort(key=lambda x: x["date"])
+            self.dates[key] = [x["date"].toordinal() for x in v]
+
+    def take(self, kind, amount, when, days, num=None):
+        key = (kind, round(abs(amount) * 100))
+        cands = self.idx.get(key, [])
+        if num is not None:
+            for ln in cands:
+                if not ln["fv_matched"] and ln["num"] == num:
+                    return ln
+            return None
+        if when is None or not cands:
+            return None
+        ds, w = self.dates[key], when.toordinal()
+        lo, hi = bisect.bisect_left(ds, w - days), bisect.bisect_right(ds, w + days)
+        best, best_gap = None, None
+        for i in range(lo, hi):
+            ln = cands[i]
+            if ln["fv_matched"]:
+                continue
+            gap = abs(ds[i] - w)
+            if best_gap is None or gap < best_gap:
+                best, best_gap = ln, gap
+        return best
+
+
+def _kind(ln):
+    t = ln["type"].lower()
+    if t == "check":
+        return "check"
+    if t in CARD_TYPES or "card" in ln["account"].lower():
+        return "card"
+    if t == "deposit" and ln["amount"] < 0:
+        return "deposit"
+    return None
+
+
+def match_transactions(fv_txns, qb_lines):
+    """Pair Filevine transactions with QB lines. Sets t['qb_match'], t['qb_ref'] on FV rows and
+    pid/how/fv_matched on the QB lines that pair up."""
+    pool = _Pool(qb_lines, _kind)
+
+    def claim(t, ln, how):
+        ln["fv_matched"] = True
+        ln["pid"] = ln["pid"] or t["pid"]
+        ln["how"] = how
+        t["qb_match"] = "Y"
+        t["qb_ref"] = f"{ln['date'].isoformat()} {ln['type']} {ln['num']}".strip()
+
+    # Check-number matches first (strongest), then date/amount matches.
+    ordered = sorted(fv_txns, key=lambda t: 0 if (t.get("src") == "Expense Request" and str(t.get("ref") or "").strip()) else 1)
+    for t in ordered:
         t["qb_match"], t["qb_ref"] = None, None
-        if not t.get("counted"):
+        if not t.get("counted") or not t.get("amount"):
             continue
-        pool = [ln for ln in by_case.get(t["pid"], []) if not ln["fv_matched"] and abs(abs(ln["amount"]) - abs(t["amount"])) < 0.005]
-        if not pool:
-            t["qb_match"] = "N"
-            continue
+        when = _date(t.get("date"))
         ref = str(t.get("ref") or "").strip()
-        td = _date(t.get("date"))
-
-        def score(ln):
-            s = 0 if ref and ln["num"] == ref else 1
-            gap = abs((ln["date"] - td).days) if td else 999
-            return (s, gap)
-
-        best = min(pool, key=score)
-        s, gap = score(best)
-        if s == 0 or gap <= days:
-            best["fv_matched"] = True
-            t["qb_match"] = "Y"
-            t["qb_ref"] = f"{best['date'].isoformat()} {best['type']} {best['num']}".strip()
-        else:
-            t["qb_match"] = "N"
+        ln = None
+        if t["src"] == "Expense Request":
+            if ref:
+                ln = pool.take("check", t["amount"], when, 0, num=ref)
+                if ln:
+                    claim(t, ln, "Matched to FV expense (check #)")
+                    continue
+            ln = pool.take("card", t["amount"], when, 7) or pool.take("check", t["amount"], when, 7)
+            if ln:
+                claim(t, ln, "Matched to FV expense (amount/date)")
+                continue
+        elif t["src"] == "Disbursal" and "Postage" not in str(t.get("method") or ""):
+            ln = pool.take("deposit", t["amount"], when, 21)
+            if ln:
+                claim(t, ln, "Matched to FV Due-to-Firm disbursal (amount, within 21 days)")
+                continue
+            t["qb_match"] = "N"  # may be picked up by the wider second pass below
+            continue
+        else:  # postage (logged or disbursed) is not posted to the QB cost account
+            t["qb_match"] = None
+            continue
+        t["qb_match"] = "N"
+    # Second pass: Filevine rarely records the disbursal check date, so the fallback date (when the
+    # disbursal row was created) can run weeks ahead of the QB deposit. Widen to 90 days.
+    for t in fv_txns:
+        if t.get("qb_match") == "N" and t["src"] == "Disbursal":
+            ln = pool.take("deposit", t["amount"], _date(t.get("date")), 90)
+            if ln:
+                claim(t, ln, "Matched to FV Due-to-Firm disbursal (amount, 22-90 days)")
     return fv_txns, qb_lines
