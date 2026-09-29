@@ -25,7 +25,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from qb_match import assign_direct, load_qb, match_transactions  # noqa: E402
+from qb_match import assign_direct, enrich_from_ledger, load_qb, match_transactions, split_general_ledger  # noqa: E402
 
 SCOPE_START = "2024-01-01"
 FV_URL = "https://hostilolaw.filevineapp.com/#/project/{}"
@@ -160,9 +160,13 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
     cases.sort(key=lambda c: (c["group"], c["ddate"] or "", c["pid"]))
     txns.sort(key=lambda t: (t["group"], t["pid"], t["date"] or ""))
 
-    qb_lines, qb_by_case, qb_status = None, defaultdict(lambda: [0.0, 0.0]), {}
+    qb_lines, qb_by_case, qb_status, trust_by_case = None, defaultdict(lambda: [0.0, 0.0]), {}, {}
     if qb_path:
-        qb_lines = assign_direct(load_qb(qb_path, flip=qb_flip), cands)
+        qb_lines, gl_other = split_general_ledger(load_qb(qb_path, flip=qb_flip))
+        qb_lines = assign_direct(qb_lines, cands)
+        trust_by_case = {}
+        if gl_other:
+            qb_lines, trust_by_case = enrich_from_ledger(qb_lines, gl_other)
         match_transactions(txns, qb_lines)
         for ln in qb_lines:
             if ln["pid"]:
@@ -245,7 +249,8 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
             "Current FV Phase", "Phase Date", "Settlement Amount", "Rejection / Fire Reason", "Requested By",
             "FV Expenses Logged", "FV Due-to-Firm Expense Disbursals", "Logged minus Disbursed", "FV QuickBooks Case Costs (synced)",
             "FV Transactions", "QB Costs Matched to Case", "QB Credits Matched to Case", "Net of Matched QB Lines",
-            "Variance (FV Disbursed - QB Credits Matched)", "QB Match Status", "QB Notes", "Notes", "Filevine Link"]
+            "Variance (FV Disbursed - QB Credits Matched)", "QB Match Status", "QB Notes", "Notes", "Filevine Link",
+            "QB Trust 'Case Exp' Checks to Firm"]
     wc.append(chdr)
     style_header(wc, 1, len(chdr))
     for i, c in enumerate(cases):
@@ -256,12 +261,13 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
                    qd, qc, f'=IF(AND(Q{r}="",R{r}=""),"",N(Q{r})-N(R{r}))', f'=IF(AND(Q{r}="",R{r}=""),"",M{r}-N(R{r}))',
                    qb_status.get(c["pid"], "") if qb_lines is not None else
                    f'=IF(AND(Q{r}="",R{r}=""),IF(M{r}>0,"Not in QB",""),IF(ABS(S{r})>=0.01,"Open balance in QB",IF(ABS(T{r})<0.01,"Matched","Variance")))',
-                   None, c["errors"] or None, FV_URL.format(c["pid"])])
+                   None, c["errors"] or None, FV_URL.format(c["pid"]),
+                   round(trust_by_case[c["pid"]], 2) if qb_lines is not None and c["pid"] in trust_by_case else None])
     last = len(cases) + 1
     for row in wc.iter_rows(min_row=2, max_row=last, max_col=len(chdr)):
         for cell in row:
             cell.font = Font(name=FONT, size=10)
-            if cell.column in (9, 12, 13, 14, 15, 17, 18, 19, 20):
+            if cell.column in (9, 12, 13, 14, 15, 17, 18, 19, 20, 25):
                 cell.number_format = MONEY
             if cell.column in (17, 18, 22):
                 cell.fill = INPUT_FILL
@@ -269,7 +275,8 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
     wc["Q1"].comment = Comment("QB cost-account debits tied to this case through its Filevine expenses (check # or amount/date) or a project ID in the QB description.", "Ledger")
     wc["R1"].comment = Comment("QB cost-account credits (Case Exp / FRD-REJ deposits) tied to this case through its Filevine Due-to-Firm disbursals.", "Ledger")
     wc["U1"].comment = Comment("Share of this case's Filevine expenses and Due-to-Firm disbursals that were found in QB. Postage is not posted line-by-line in QB and is not counted.", "Ledger")
-    widths = [12, 38, 24, 16, 30, 12, 24, 11, 14, 26, 11, 14, 14, 14, 14, 10, 14, 14, 14, 14, 20, 24, 24, 42]
+    widths = [12, 38, 24, 16, 30, 12, 24, 11, 14, 26, 11, 14, 14, 14, 14, 10, 14, 14, 14, 14, 20, 24, 24, 42, 14]
+    wc["Y1"].comment = Comment("Total of the trust-account checks to the firm memo'd '<client> (<ID>):Case Exp' for this case, read from the full QB general ledger. Should equal the Filevine Due-to-Firm expense disbursal.", "Ledger")
     for i, w in enumerate(widths):
         wc.column_dimensions[get_column_letter(i + 1)].width = w
     wc.freeze_panes = "C2"
@@ -342,7 +349,7 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
                 return "Closed - no FV cost activity"
             if pid in pulled:
                 return "Closed - disposition before " + SCOPE_START
-            return "Case not in closed-case list"
+            return "Open or pre-2024 case (not in the closed-case list)"
         scope_d = date.fromisoformat(SCOPE_START)
         shown = [ln for ln in qb_lines if ln["date"] >= scope_d or ln["pid"]]
         wq = wb.create_sheet("QB Detail")
@@ -353,7 +360,7 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
         for ln in sorted(shown, key=lambda x: x["date"]):
             pid = ln["pid"]
             wq.append([ln["date"].isoformat(), ln["type"], ln["num"], ln["name"], ln["cls"], ln["memo"], ln["account"],
-                       ln["amount"], pid, cands[pid]["projectName"] if pid else None, ln["how"], case_status(pid),
+                       ln["amount"], pid, cands[pid]["projectName"] if pid in cands else None, ln["how"], case_status(pid),
                        "Y" if ln["fv_matched"] else "N"])
         for row in wq.iter_rows(min_row=2, max_col=len(qhdr)):
             for cell in row:
@@ -397,8 +404,8 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
             ("QB account balance, all dates (ties to the QB report total)", sum(ln["amount"] for ln in qb_lines)),
             (f"QB costs posted since {SCOPE_START}", sum(ln["amount"] for ln in insc if ln["amount"] > 0)),
             (f"QB credits (reimbursed / written off) since {SCOPE_START}", -sum(ln["amount"] for ln in insc if ln["amount"] < 0)),
-            ("  of which costs tied to a closed Filevine case", sum(ln["amount"] for ln in insc if ln["amount"] > 0 and ln["pid"])),
-            ("  of which credits tied to a closed Filevine case", -sum(ln["amount"] for ln in insc if ln["amount"] < 0 and ln["pid"])),
+            ("  of which costs tied to a Filevine case", sum(ln["amount"] for ln in insc if ln["amount"] > 0 and ln["pid"])),
+            ("  of which credits tied to a Filevine case", -sum(ln["amount"] for ln in insc if ln["amount"] < 0 and ln["pid"])),
             ("  costs not traceable to a Filevine case", sum(ln["amount"] for ln in insc if ln["amount"] > 0 and not ln["pid"])),
             ("  credits not traceable to a Filevine case", -sum(ln["amount"] for ln in insc if ln["amount"] < 0 and not ln["pid"])),
         ]

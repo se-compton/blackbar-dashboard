@@ -99,10 +99,14 @@ def load_qb(path, flip=False):
     rows = _rows(path)
     hi, cols = _find_header(rows)
     lines = []
+    acct = None
     for row in rows[hi + 1:]:
         get = lambda k: row[cols[k]] if k in cols and cols[k] < len(row) else None
         d = _date(get("date"))
         if d is None:
+            first = row[0] if row else None
+            if first and not str(first).startswith(("Total", "TOTAL", "Accrual", "Cash Basis")):
+                acct = str(first).strip()
             continue
         amt = _money(get("amount"))
         if amt is None:
@@ -113,8 +117,75 @@ def load_qb(path, flip=False):
         lines.append(dict(date=d, type=str(get("type") or ""), num=str(get("num") or "").strip(),
                           name=str(get("name") or ""), memo=str(get("memo") or ""),
                           account=str(get("account") or ""), cls=str(get("cls") or ""),
-                          amount=round(amt, 2), pid=None, how=None, fv_matched=False))
+                          amount=round(amt, 2), pid=None, how=None, fv_matched=False, acct=acct))
     return lines
+
+
+COST_ACCOUNT = "Advanced Client Costs"
+FV_ID = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")
+
+
+def _fv_id(text):
+    """First plausible Filevine project ID (7-8 digits, 8M-16M range) in a memo."""
+    for m in FV_ID.finditer(text or ""):
+        v = int(m.group(1))
+        if 8_000_000 <= v < 16_000_000:
+            return v
+    return None
+
+
+def split_general_ledger(lines):
+    """For a full general-ledger export, return (cost-account lines, all other lines).
+    For a single-account export, everything is the cost account."""
+    accts = {ln["acct"] for ln in lines}
+    if len(accts) <= 1:
+        return lines, []
+    return ([ln for ln in lines if ln["acct"] == COST_ACCOUNT],
+            [ln for ln in lines if ln["acct"] != COST_ACCOUNT])
+
+
+def enrich_from_ledger(cost_lines, other_lines):
+    """Tie cost-account lines to cases using the other side of each transaction in a full GL:
+      - cost checks  <- the Hostilo Cost bank line with the same check # and amount (memo 'Name/ID/...')
+      - card charges <- the card-account line with the same date and amount whose memo holds an ID
+      - Case Exp deposits (credits) <- the trust check to the firm memo'd 'Last, First (ID):Case Exp'
+        with the same amount within 14 days
+    Also returns {pid: total} of trust 'Case Exp' checks paid to the firm, by case."""
+    bank = {}
+    card = {}
+    trust = {}
+    trust_by_case = {}
+    for ln in other_lines:
+        a = ln["acct"] or ""
+        pid = _fv_id(f"{ln['name']} {ln['memo']}")
+        if "Cost (6455)" in a and ln["type"] == "Check" and pid:
+            bank.setdefault((ln["num"], round(abs(ln["amount"]) * 100)), []).append(pid)
+        elif ("7818" in a or "COST SRC" in a or "7184" in a) and pid:
+            card.setdefault((ln["date"], round(abs(ln["amount"]) * 100)), []).append(pid)
+        elif a == "Hostilo Trust" and ln["type"] == "Check" and "hostilo" in ln["name"].lower() \
+                and re.search(r"case\s*exp", ln["memo"], re.I) and pid:
+            trust.setdefault(round(abs(ln["amount"]) * 100), []).append([ln["date"], pid, False])
+            trust_by_case[pid] = trust_by_case.get(pid, 0.0) + abs(ln["amount"])
+    for ln in cost_lines:
+        if ln["pid"]:
+            continue
+        key = round(abs(ln["amount"]) * 100)
+        if ln["type"] == "Check" and (ln["num"], key) in bank:
+            ln["pid"], ln["how"] = bank[(ln["num"], key)][0], "Case ID on the cost-bank side of the check"
+        elif ln["type"] != "Deposit" and (ln["date"], key) in card:
+            ln["pid"], ln["how"] = card[(ln["date"], key)][0], "Case ID on the card-account side of the charge"
+        elif ln["type"] == "Deposit" and ln["amount"] < 0 and key in trust:
+            best, gap = None, None
+            for cand in trust[key]:
+                if cand[2]:
+                    continue
+                g = abs((cand[0] - ln["date"]).days)
+                if g <= 14 and (gap is None or g < gap):
+                    best, gap = cand, g
+            if best:
+                best[2] = True
+                ln["pid"], ln["how"] = best[1], "Trust 'Case Exp' check to the firm (amount/date)"
+    return cost_lines, trust_by_case
 
 
 def assign_direct(lines, cands):
@@ -141,12 +212,12 @@ class _Pool:
             v.sort(key=lambda x: x["date"])
             self.dates[key] = [x["date"].toordinal() for x in v]
 
-    def take(self, kind, amount, when, days, num=None):
+    def take(self, kind, amount, when, days, num=None, pid=None):
         key = (kind, round(abs(amount) * 100))
         cands = self.idx.get(key, [])
         if num is not None:
             for ln in cands:
-                if not ln["fv_matched"] and ln["num"] == num:
+                if not ln["fv_matched"] and ln["num"] == num and not (ln["pid"] and pid and ln["pid"] != pid):
                     return ln
             return None
         if when is None or not cands:
@@ -156,7 +227,7 @@ class _Pool:
         best, best_gap = None, None
         for i in range(lo, hi):
             ln = cands[i]
-            if ln["fv_matched"]:
+            if ln["fv_matched"] or (ln["pid"] and pid and ln["pid"] != pid):
                 continue
             gap = abs(ds[i] - w)
             if best_gap is None or gap < best_gap:
@@ -182,8 +253,10 @@ def match_transactions(fv_txns, qb_lines):
 
     def claim(t, ln, how):
         ln["fv_matched"] = True
-        ln["pid"] = ln["pid"] or t["pid"]
-        ln["how"] = how
+        if ln["pid"] == t["pid"] and ln["how"]:
+            ln["how"] = f"{ln['how']}; confirmed by Filevine"
+        else:
+            ln["pid"], ln["how"] = t["pid"], how
         t["qb_match"] = "Y"
         t["qb_ref"] = f"{ln['date'].isoformat()} {ln['type']} {ln['num']}".strip()
 
@@ -198,16 +271,16 @@ def match_transactions(fv_txns, qb_lines):
         ln = None
         if t["src"] == "Expense Request":
             if ref:
-                ln = pool.take("check", t["amount"], when, 0, num=ref)
+                ln = pool.take("check", t["amount"], when, 0, num=ref, pid=t["pid"])
                 if ln:
                     claim(t, ln, "Matched to FV expense (check #)")
                     continue
-            ln = pool.take("card", t["amount"], when, 7) or pool.take("check", t["amount"], when, 7)
+            ln = pool.take("card", t["amount"], when, 7, pid=t["pid"]) or pool.take("check", t["amount"], when, 7, pid=t["pid"])
             if ln:
                 claim(t, ln, "Matched to FV expense (amount/date)")
                 continue
         elif t["src"] == "Disbursal" and "Postage" not in str(t.get("method") or ""):
-            ln = pool.take("deposit", t["amount"], when, 21)
+            ln = pool.take("deposit", t["amount"], when, 21, pid=t["pid"])
             if ln:
                 claim(t, ln, "Matched to FV Due-to-Firm disbursal (amount, within 21 days)")
                 continue
@@ -221,7 +294,7 @@ def match_transactions(fv_txns, qb_lines):
     # disbursal row was created) can run weeks ahead of the QB deposit. Widen to 90 days.
     for t in fv_txns:
         if t.get("qb_match") == "N" and t["src"] == "Disbursal":
-            ln = pool.take("deposit", t["amount"], _date(t.get("date")), 90)
+            ln = pool.take("deposit", t["amount"], _date(t.get("date")), 90, pid=t["pid"])
             if ln:
                 claim(t, ln, "Matched to FV Due-to-Firm disbursal (amount, 22-90 days)")
     return fv_txns, qb_lines
