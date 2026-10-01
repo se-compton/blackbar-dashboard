@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qb_match import assign_direct, enrich_from_ledger, load_qb, match_transactions, split_general_ledger  # noqa: E402
 
 SCOPE_START = "2024-01-01"
+SUSPECT_AMOUNT = 100000  # no single case-cost check should approach this
 FV_URL = "https://hostilolaw.filevineapp.com/#/project/{}"
 
 FONT = "Arial"
@@ -109,6 +110,7 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
                 pulled[int(r["projectId"])] = r
 
     cases, txns, out_of_scope, missing, screened = [], [], Counter(), [], []
+    suspect = []
     for pid, case in cands.items():
         r = pulled.get(pid)
         if r is None:
@@ -126,6 +128,10 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
         rows = []
         for e in r.get("exp") or []:
             void = (e.get("status") or "") == "Void"
+            # An amount equal to the project ID (or absurdly large) is a typo in Filevine, not a real cost.
+            if num(e.get("amount")) and (num(e.get("amount")) == pid or num(e.get("amount")) > SUSPECT_AMOUNT):
+                suspect.append((pid, case["projectName"], e.get("checkNumber"), e.get("payee"), num(e.get("amount"))))
+                void = True
             rows.append(dict(src="Expense Request", kind="Advance", date=d10(e.get("dateOfCheck")) or d10(e.get("date")) or d10(e.get("created")),
                              payee=e.get("payee"), memo=e.get("memo") or e.get("description"), ref=e.get("checkNumber"),
                              method=e.get("expenseType"), status=e.get("status"), amount=num(e.get("amount")),
@@ -442,6 +448,11 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
         wg.append(["Filevine expenses / disbursals NOT found in QB", sum(1 for t in txns if t.get("qb_match") == "N")])
         wg.append(["QB lines since " + SCOPE_START + " not traceable to a Filevine case (see QB Not Traceable tab)",
                    sum(1 for ln in qb_lines if ln["date"] >= date.fromisoformat(SCOPE_START) and not ln["pid"])])
+    if suspect:
+        wg.append([])
+        wg.append(["Expense requests with an impossible amount (excluded from totals; correct in Filevine)", len(suspect)])
+        for pid, name, chk, payee, amt in suspect:
+            wg.append([f"  {pid} {name}: check {chk or 'n/a'} to {payee or 'n/a'}", f"{amt:,.2f} entered in Filevine"])
     if missing:
         wg.append([])
         wg.append(["Missing Filevine Project IDs", ", ".join(str(m) for m in missing[:500])])
