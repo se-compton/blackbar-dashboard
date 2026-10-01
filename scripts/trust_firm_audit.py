@@ -44,6 +44,7 @@ FEE_INCOME = "Disbursement Income"
 FIRM = "Hostilo, LLC"
 LOW_FEE_PCT = 0.20      # fee under 20% of gross settlement is flagged for review
 SHORT_TOL = 25.00       # cost reimbursement short by more than this is flagged
+CLOSED_PHASES = {"Archived"}  # only cases Filevine shows as closed out; open/active phases are skipped
 RECENT_DAYS = 21        # client paid this close to the QB data cutoff: firm checks may simply be pending
 CASE_ID = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")  # "(12345678)", "{12345678}" or older "12345678/Last, First/..."
 FEE_RE = re.compile(r"att?n?y\b|attorney|af\s*reimb", re.I)
@@ -125,12 +126,15 @@ def main(data_dir, qb_path, out_path, as_of):
         elif "Trust 'Case Exp'" in (ln["how"] or ""):
             cost_landed[ln["pid"]] += -ln["amount"]
 
-    rows, flagged = [], []
+    rows, flagged, skipped_open = [], [], defaultdict(int)
     for pid, case in cands.items():
         r = pulled.get(pid) or {}
         cs = r.get("cs") or {}
         group, detail, ddate, settled = disposition(case, cs)
         if group != "Settled" or (ddate or "") < SCOPE_START:
+            continue
+        if case["phase"] not in CLOSED_PHASES:
+            skipped_open[case["phase"]] += 1
             continue
         t = trust.get(pid, {})
         fv_logged = sum(num(e.get("amount")) for e in r.get("exp") or [] if (e.get("status") or "") != "Void") + \
@@ -175,32 +179,52 @@ def main(data_dir, qb_path, out_path, as_of):
         if flags:
             flagged.append(row)
 
-    write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in)
+    write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in, skipped_open)
     counts = defaultdict(int)
     for r in flagged:
         for f in r["flags"].split("; "):
             counts[f] += 1
-    print(json.dumps(dict(settled_cases=len(rows), flagged=len(flagged), by_flag=counts), indent=1))
+    print(json.dumps(dict(settled_cases=len(rows), skipped_open=skipped_open, flagged=len(flagged), by_flag=counts), indent=1))
 
 
 HEAD = ["Filevine Project ID", "Case Name", "Settlement Date", "FV Gross Settlement", "Paid to Client (trust)",
         "Paid to Third Parties (trust)", "Atty Fee to Firm (trust)", "Fee % of Settlement", "Case Exp to Firm (trust)",
         "Postage to Firm (trust)", "Other to Firm (trust)", "Total Paid Out of Trust", "Settlement minus Paid Out",
         "QB Costs Advanced (cost acct)", "FV Costs Logged", "FV Due-to-Firm Expense Disbursal",
-        "Case Exp Landed in Cost Acct", "FV Write-off (FRD/REJ)", "Exceptions", "Filevine Link", "Last Client Payment (trust)"]
+        "Case Exp Landed in Cost Acct", "FV Write-off (FRD/REJ)", "Exceptions", "Filevine Link", "Last Client Payment (trust)", "Priority", "Next Step"]
+
+
+ACTIONS = [  # (flag text, priority, next step); first match sets the priority
+    ("no attorney fee check", 1, "Pull the closing statement and trust ledger card; confirm whether the fee was earned and never moved to operating."),
+    ("another memo", 2, "Fee appears paid under the wrong memo; confirm the check and recode it as Atty Fee."),
+    ("no Case Exp reimbursement", 2, "Costs advanced but never reimbursed; confirm against the closing statement and move funds or record the write-off."),
+    ("short of costs", 2, "Compare the closing statement cost line to costs advanced; reimburse the difference or document the reduction."),
+    ("not found in cost account", 2, "Locate the deposit of this trust Case Exp check in the cost account (6455); confirm it cleared."),
+    ("Fee under", 3, "Confirm the fee against the fee agreement and closing statement (reduction, split, or short)."),
+    ("No trust checks", 3, "Confirm whether the settlement ran through trust under another case ID or was paid outside trust."),
+    ("not fully run through trust", 4, "Compare trust ledger to the closing statement: pending liens, funds held, Med Pay, or money still owed out."),
+]
+
+
+def triage(flags):
+    for key, pri, step in ACTIONS:
+        if key in flags:
+            note = " Recent payout: recheck before acting." if "data cutoff" in flags else ""
+            return pri, step + note
+    return 4, "Review."
 
 
 def case_row(ws, i, r):
     ws.append([r["pid"], r["name"], r["ddate"], r["settled"], r["client"], r["third"], r["fee"], None, r["cost"],
                r["postage"], r["firm_other"], r["out_total"], None, r["cost_adv"], r["fv_logged"], r["fv_disb"],
-               r["landed"], "Yes" if r["writeoff"] else "", r["flags"], FV_URL.format(r["pid"]), r["paid_on"]])
+               r["landed"], "Yes" if r["writeoff"] else "", r["flags"], FV_URL.format(r["pid"]), r["paid_on"]] + list(triage(r["flags"])))
     ws.cell(i, 8, f'=IF(D{i}=0,"",G{i}/D{i})').number_format = "0.0%"
     ws.cell(i, 13, f"=D{i}-L{i}")
     for c in (4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17):
         ws.cell(i, c).number_format = MONEY
 
 
-def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in):
+def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in, skipped_open):
     wb = Workbook()
     ws = wb.active
     ws.title = "Summary"
@@ -228,10 +252,12 @@ def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in)
                    f'=SUMIFS(Exceptions!${col}$2:${col}${n},Exceptions!$S$2:$S${n},"*{label}*")', desc])
         ws.cell(i, 3).number_format = MONEY
     r0 = 5 + len(defs) + 1
-    ws.cell(r0, 1, "Settled cases reviewed").font = bold
+    ws.cell(r0, 1, "Settled cases reviewed (Filevine phase: " + ", ".join(sorted(CLOSED_PHASES)) + ")").font = bold
     ws.cell(r0, 2, len(rows))
     ws.cell(r0 + 1, 1, "Cases with at least one exception").font = bold
     ws.cell(r0 + 1, 2, len(flagged))
+    ws.cell(r0 + 2, 1, "Skipped, still open/active in Filevine: " + ", ".join(f"{k} {v}" for k, v in sorted(skipped_open.items())))
+    r0 += 1
     notes = [
         "Method",
         "1. Every trust bank check in QuickBooks is tagged to a case by the Filevine ID in its memo or payee, e.g. 'Last, First (12345678):Atty Fee'.",
@@ -249,7 +275,7 @@ def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in)
     ws.column_dimensions["C"].width = 18
     ws.column_dimensions["D"].width = 110
 
-    for title, data in (("Exceptions", sorted(flagged, key=lambda r: (-r["settled"], r["pid"]))),
+    for title, data in (("Exceptions", sorted(flagged, key=lambda r: (triage(r["flags"])[0], -r["settled"], r["pid"]))),
                         ("All Settled Cases", sorted(rows, key=lambda r: r["pid"]))):
         sh = wb.create_sheet(title)
         sh.append(HEAD)
@@ -259,7 +285,7 @@ def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in)
         if data:
             add_table(sh, title.replace(" ", ""), 1, len(data) + 1, len(HEAD))
         sh.freeze_panes = "C2"
-        for c, w in zip("ABCDEFGHIJKLMNOPQRSTU", [12, 34, 12] + [14] * 15 + [60, 18, 12]):
+        for c, w in zip("ABCDEFGHIJKLMNOPQRSTUVW", [12, 34, 12] + [14] * 15 + [60, 18, 12, 9, 70]):
             sh.column_dimensions[c].width = w
 
     st = wb.create_sheet("Fee Tie-Out")
