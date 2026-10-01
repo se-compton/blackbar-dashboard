@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 logs/history/
 *.log
+
+# Firm finance files: client data, never push (repo is public)
+TRANSFER_*.md
+*.xlsx
+*.pdf
