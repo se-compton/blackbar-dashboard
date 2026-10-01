@@ -269,7 +269,7 @@ def match_transactions(fv_txns, qb_lines):
         when = _date(t.get("date"))
         ref = str(t.get("ref") or "").strip()
         ln = None
-        if t["src"] == "Expense Request":
+        if t["src"] in ("Expense Request", "Case Expense (Postage section)"):
             if ref:
                 ln = pool.take("check", t["amount"], when, 0, num=ref, pid=t["pid"])
                 if ln:

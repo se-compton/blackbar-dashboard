@@ -134,8 +134,12 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
         for p in r.get("post") or []:
             void = (p.get("status") or "") == "Voided"
             amt = num(p.get("amountdue")) or num(p.get("transactionamount")) or num(p.get("amountpaid"))
-            rows.append(dict(src="Postage", kind="Advance", date=d10(p.get("date")) or d10(p.get("checkdate")) or d10(p.get("created")),
-                             payee="Postage", memo=p.get("memo"), ref=p.get("checknumber"), method="Postage",
+            # A few cases log real case expenses in the postage section; keep those in the QB match.
+            case_exp = (p.get("expenseType") or "") == "Case Expense"
+            rows.append(dict(src="Case Expense (Postage section)" if case_exp else "Postage", kind="Advance",
+                             date=d10(p.get("date")) or d10(p.get("checkdate")) or d10(p.get("created")),
+                             payee=None if case_exp else "Postage", memo=p.get("memo"), ref=p.get("checknumber"),
+                             method="Case Expense" if case_exp else "Postage",
                              status=p.get("status"), amount=amt, toqb=None, qbupd=None, counted=not void))
         for d in r.get("disb") or []:
             void = (d.get("status") or "") == "Voided"
