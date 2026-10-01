@@ -107,7 +107,13 @@ def main(data_dir, out_path, as_of, qb_path=None, qb_flip=False):
         for line in open(f):
             if line.strip():
                 r = json.loads(line)
-                pulled[int(r["projectId"])] = r
+                pid = int(r["projectId"])
+                # Sweep files (sorted after batch files) add disbursal rows the first pass skipped.
+                if "add_disb" in r and pid in pulled and not pulled[pid].get("screen"):
+                    seen = {d.get("itemId") for d in pulled[pid].get("disb") or []}
+                    pulled[pid].setdefault("disb", []).extend(d for d in r["add_disb"] if d.get("itemId") not in seen)
+                    continue
+                pulled[pid] = r
 
     cases, txns, out_of_scope, missing, screened = [], [], Counter(), [], []
     suspect = []
