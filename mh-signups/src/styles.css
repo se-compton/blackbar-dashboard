@@ -1,0 +1,112 @@
+:root {
+  --bg: #0e1116;
+  --fg: #f5f7fa;
+  --muted: #a3acb9;
+  --line: #2a313b;
+  --warn: #f6c453;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+.screen {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding:
+    max(1rem, env(safe-area-inset-top))
+    max(1.25rem, env(safe-area-inset-right))
+    max(0.75rem, env(safe-area-inset-bottom))
+    max(1.25rem, env(safe-area-inset-left));
+  max-width: 34rem;
+  margin: 0 auto;
+}
+
+.top { text-align: center; }
+.firm { margin: 0; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.app-name { margin: 0.1rem 0 0; font-size: 1.05rem; font-weight: 600; }
+
+.demo-flag {
+  align-self: center;
+  margin: 0;
+  padding: 0.3rem 0.8rem;
+  border: 2px solid var(--warn);
+  color: var(--warn);
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+.demo-flag[hidden] { display: none; }
+
+.metrics {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  gap: 0.5rem;
+  text-align: center;
+}
+
+.metric { padding: 0; }
+.metric-label { margin: 0; font-size: 0.85rem; font-weight: 700; letter-spacing: 0.14em; color: var(--muted); }
+.metric-value { margin: 0; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+.metric-note { margin: 0.25rem 0 0; font-size: 0.85rem; color: var(--muted); }
+.metric-note[hidden] { display: none; }
+
+.metric-today .metric-label { font-size: 1rem; color: var(--fg); }
+.metric-today .metric-value { font-size: clamp(5rem, min(38vw, 22vh), 13rem); }
+.metric-week .metric-value,
+.metric-month .metric-value { font-size: clamp(2.6rem, min(15vw, 9vh), 4.75rem); }
+
+@supports (height: 1dvh) {
+  .metric-today .metric-value { font-size: clamp(5rem, min(38vw, 22dvh), 13rem); }
+  .metric-week .metric-value,
+  .metric-month .metric-value { font-size: clamp(2.6rem, min(15vw, 9dvh), 4.75rem); }
+}
+
+.banners { min-height: 0; text-align: center; }
+.banner { margin: 0.25rem 0 0; font-weight: 700; color: var(--warn); }
+
+.foot { border-top: 1px solid var(--line); padding-top: 0.5rem; text-align: center; }
+.foot-text { margin: 0; font-size: 0.8rem; color: var(--muted); }
+.foot-actions { display: flex; justify-content: center; gap: 1.5rem; }
+
+.link {
+  appearance: none;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8rem;
+  text-decoration: underline;
+  padding: 0.7rem 0.25rem;
+  min-height: 2.75rem;
+  cursor: pointer;
+}
+.link:disabled { opacity: 0.6; cursor: default; }
+.link:focus-visible, .login-input:focus-visible, .login-button:focus-visible { outline: 3px solid var(--fg); outline-offset: 2px; }
+
+.login { display: flex; flex-direction: column; gap: 0.75rem; margin: auto 0; }
+.login-label { font-size: 0.9rem; color: var(--muted); }
+.login-input {
+  font: inherit; font-size: 1.1rem; padding: 0.85rem; border-radius: 0.5rem;
+  border: 1px solid var(--line); background: #171c24; color: var(--fg);
+}
+.login-button {
+  font: inherit; font-size: 1.05rem; font-weight: 700; padding: 0.85rem; border-radius: 0.5rem;
+  border: 0; background: var(--fg); color: var(--bg); cursor: pointer;
+}
+.login-button:disabled { opacity: 0.6; }
+.login-message { min-height: 1.25rem; margin: 0; color: var(--warn); font-size: 0.9rem; }
+.blocked { margin: auto 0; text-align: center; color: var(--warn); font-weight: 600; }
