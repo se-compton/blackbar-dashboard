@@ -45,6 +45,7 @@ FIRM = "Hostilo, LLC"
 LOW_FEE_PCT = 0.20      # fee under 20% of gross settlement is flagged for review
 SHORT_TOL = 25.00       # cost reimbursement short by more than this is flagged
 CLOSED_PHASES = {"Archived"}  # only cases Filevine shows as closed out; open/active phases are skipped
+DEFAULT_FEE_PCT = 1 / 3  # contingency fee assumed when no fee was taken (editable on the tab)
 RECENT_DAYS = 21        # client paid this close to the QB data cutoff: firm checks may simply be pending
 CASE_ID = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")  # "(12345678)", "{12345678}" or older "12345678/Last, First/..."
 FEE_RE = re.compile(r"att?n?y\b|attorney|af\s*reimb", re.I)
@@ -224,6 +225,60 @@ def case_row(ws, i, r):
         ws.cell(i, c).number_format = MONEY
 
 
+def firm_money_tab(wb, rows):
+    """Cases where the client was paid, money appears to remain in trust, and the firm's fee or
+    cost reimbursement was never taken: firm money that may still be sitting in trust."""
+    picks = []
+    for r in rows:
+        costs_expected = max(r["cost_adv"], r["fv_disb"])
+        left = r["settled"] - r["out_total"]
+        no_fee = r["fee"] == 0 and r["firm_other"] + max(0.0, r["cost"] - costs_expected) < LOW_FEE_PCT * r["settled"]
+        cost_owed = 0.0 if r["writeoff"] else max(0.0, costs_expected - r["cost"])
+        fee_owed = r["settled"] * DEFAULT_FEE_PCT if no_fee else 0.0
+        if r["client"] > 0 and r["settled"] > 0 and left > 1 and fee_owed + cost_owed > 1:
+            picks.append((min(left, fee_owed + cost_owed), r, no_fee, costs_expected))
+    picks.sort(key=lambda p: -p[0])
+
+    ws = wb.create_sheet("Firm Money in Trust", 1)
+    ws["A1"] = "Firm money that may still be sitting in trust"
+    ws["A1"].font = Font(name=FONT, bold=True, size=14)
+    ws["A2"] = "Fee % used when no fee was taken (change to recalc):"
+    ws["E2"] = DEFAULT_FEE_PCT
+    ws["E2"].number_format = "0.00%"
+    ws["E2"].font = Font(name=FONT, size=10, bold=True, color="0000FF")  # input cell
+    ws["A3"] = "Total likely firm money in trust:"
+    ws["A4"] = ("Client already paid from trust; Filevine settlement exceeds everything paid out of trust; and the firm's fee "
+                "or cost reimbursement was never taken. 'Left in Trust' is inferred from the Filevine settlement because trust "
+                "deposits are not tagged by case. Confirm each against the client trust ledger card and closing statement before moving funds.")
+    head = ["Filevine Project ID", "Case Name", "Last Client Payment", "Gross Settlement", "Paid Out of Trust",
+            "Est. Left in Trust", "No Fee Taken", "Est. Fee Owed", "Costs Advanced", "Cost Reimbursed (trust)",
+            "Costs Owed", "Likely Firm $ in Trust", "Verify", "Filevine Link"]
+    hr = 6
+    for c, h in enumerate(head, 1):
+        ws.cell(hr, c, h)
+    style_header(ws, hr, len(head))
+    for i, (_, r, no_fee, costs_expected) in enumerate(picks, start=hr + 1):
+        verify = "Costs advanced look high for the case; confirm the cost ledger." if costs_expected > max(5000.0, 0.25 * r["settled"]) else ""
+        ws.append([r["pid"], r["name"], r["paid_on"], r["settled"], r["out_total"], f"=D{i}-E{i}",
+                   "Yes" if no_fee else "No", f'=IF(G{i}="Yes",D{i}*$E$2,0)', costs_expected, r["cost"],
+                   0 if r["writeoff"] else f"=MAX(0,I{i}-J{i})",
+                   f"=MAX(0,MIN(F{i},H{i}+K{i}))", verify, FV_URL.format(r["pid"])])
+        for c in (4, 5, 6, 8, 9, 10, 11, 12):
+            ws.cell(i, c).number_format = MONEY
+    last = hr + len(picks)
+    ws["E3"] = f"=SUM(L{hr + 1}:L{max(last, hr + 1)})"
+    ws["E3"].number_format = MONEY
+    ws["E3"].font = Font(name=FONT, bold=True, size=12)
+    if picks:
+        add_table(ws, "FirmMoneyInTrust", hr, last, len(head))
+    ws.freeze_panes = f"C{hr + 1}"
+    for c, w in zip("ABCDEFGHIJKLMN", [12, 34, 12, 14, 14, 14, 9, 13, 14, 14, 12, 15, 44, 18]):
+        ws.column_dimensions[c].width = w
+    ws["A4"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws.merge_cells("A4:N4")
+    ws.row_dimensions[4].height = 45
+
+
 def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in, skipped_open):
     wb = Workbook()
     ws = wb.active
@@ -287,6 +342,8 @@ def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in,
         sh.freeze_panes = "C2"
         for c, w in zip("ABCDEFGHIJKLMNOPQRSTUVW", [12, 34, 12] + [14] * 15 + [60, 18, 12, 9, 70]):
             sh.column_dimensions[c].width = w
+
+    firm_money_tab(wb, rows)
 
     st = wb.create_sheet("Fee Tie-Out")
     st.append(["Month", "Atty Fee Checks Written from Trust", "Disbursement Income Deposited", "Difference", "Running Undeposited"])
