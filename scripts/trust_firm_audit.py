@@ -50,6 +50,11 @@ RECENT_DAYS = 21        # client paid this close to the QB data cutoff: firm che
 CASE_ID = re.compile(r"(?<!\d)(\d{7,8})(?!\d)")  # "(12345678)", "{12345678}" or older "12345678/Last, First/..."
 FEE_RE = re.compile(r"att?n?y\b|attorney|af\s*reimb", re.I)
 COST_RE = re.compile(r"case\s*exp|:\s*cas(e)?\s*$", re.I)
+# Probate, bankruptcy, minor settlements, deceased clients and attorney liens hold the firm's money until a
+# court or trustee releases it, so a missing fee or cost reimbursement on those cases is pending, not a miss.
+EXT_RE = re.compile(r"probate|\bbky\b|bankrupt|\bminor\b|pro\s*ami|guardian|conservator|deceased|estate of|"
+                    r"heirs|sending to state|atty\s*lien|filed lien|not finalized", re.I)
+PENDING_ON = ("no attorney fee check", "Fee under", "no Case Exp reimbursement", "short of costs")
 CLIENT_RE = re.compile(r"PI Settlement|Remaining PI|Medpay|Partial (Payment|Disbursement)|PD Proceeds", re.I)
 
 
@@ -80,6 +85,10 @@ def load_fv(data_dir):
 
 def main(data_dir, qb_path, out_path, as_of):
     cands, pulled = load_fv(data_dir)
+    log_notes = {}  # pid -> Disbursed List notes, written by disbursement_log_check.py when it has been run
+    if os.path.exists(os.path.join(data_dir, "log_notes.json")):
+        with open(os.path.join(data_dir, "log_notes.json")) as f:
+            log_notes = json.load(f)
     lines = load_qb(qb_path)
     start = date.fromisoformat(SCOPE_START)
 
@@ -171,7 +180,11 @@ def main(data_dir, qb_path, out_path, as_of):
             flags.append("Settlement not fully run through trust")
         if cost - cost_landed.get(pid, 0.0) > SHORT_TOL:
             flags.append("Case Exp check from trust not found in cost account")
-        row = dict(pid=pid, name=case["projectName"], ddate=ddate, paid_on=paid_on.isoformat() if paid_on else None, settled=settled, client=client, third=third,
+        ext = EXT_RE.search(f'{case["projectName"]} {log_notes.get(str(pid), "")}')
+        ext = ext.group(0).strip().title() if ext else ""
+        if ext and any(k in f for f in flags for k in PENDING_ON):
+            flags = [f"Pending or court-limited: extenuating circumstance ({ext})"] + [f for f in flags if not any(k in f for k in PENDING_ON)]
+        row = dict(pid=pid, name=case["projectName"], ext=ext, ddate=ddate, paid_on=paid_on.isoformat() if paid_on else None, settled=settled, client=client, third=third,
                    fee=fee, fee_pct=(fee / settled) if settled else None, cost=cost, postage=t.get("postage", 0.0),
                    firm_other=t.get("firm_other", 0.0), out_total=out_total, cost_adv=cost_adv.get(pid, 0.0),
                    fv_logged=fv_logged, fv_disb=fv_disb, landed=cost_landed.get(pid, 0.0), writeoff=writeoff,
@@ -203,6 +216,7 @@ ACTIONS = [  # (flag text, priority, next step); first match sets the priority
     ("not found in cost account", 2, "Locate the deposit of this trust Case Exp check in the cost account (6455); confirm it cleared."),
     ("Fee under", 3, "Confirm the fee against the fee agreement and closing statement (reduction, split, or short)."),
     ("No trust checks", 3, "Confirm whether the settlement ran through trust under another case ID or was paid outside trust."),
+    ("extenuating circumstance", 4, "Probate, bankruptcy, minor or lien: the fee waits on (or was limited by) a court or trustee. Confirm the court order covers the fee taken; track aging; act once the release order is in."),
     ("not fully run through trust", 4, "Compare trust ledger to the closing statement: pending liens, funds held, Med Pay, or money still owed out."),
 ]
 
@@ -246,13 +260,14 @@ def firm_money_tab(wb, rows):
     ws["E2"] = DEFAULT_FEE_PCT
     ws["E2"].number_format = "0.00%"
     ws["E2"].font = Font(name=FONT, size=10, bold=True, color="0000FF")  # input cell
-    ws["A3"] = "Total likely firm money in trust:"
+    ws["A3"] = "Total likely firm money in trust (excl. pending):"
+    ws["G3"] = "Pending (probate/BKY/minor/lien):"
     ws["A4"] = ("Client already paid from trust; Filevine settlement exceeds everything paid out of trust; and the firm's fee "
                 "or cost reimbursement was never taken. 'Left in Trust' is inferred from the Filevine settlement because trust "
                 "deposits are not tagged by case. Confirm each against the client trust ledger card and closing statement before moving funds.")
     head = ["Filevine Project ID", "Case Name", "Last Client Payment", "Gross Settlement", "Paid Out of Trust",
             "Est. Left in Trust", "No Fee Taken", "Est. Fee Owed", "Costs Advanced", "Cost Reimbursed (trust)",
-            "Costs Owed", "Likely Firm $ in Trust", "Verify", "Filevine Link"]
+            "Costs Owed", "Likely Firm $ in Trust", "Verify", "Filevine Link", "Pending Reason"]
     hr = 6
     for c, h in enumerate(head, 1):
         ws.cell(hr, c, h)
@@ -262,20 +277,23 @@ def firm_money_tab(wb, rows):
         ws.append([r["pid"], r["name"], r["paid_on"], r["settled"], r["out_total"], f"=D{i}-E{i}",
                    "Yes" if no_fee else "No", f'=IF(G{i}="Yes",D{i}*$E$2,0)', costs_expected, r["cost"],
                    0 if r["writeoff"] else f"=MAX(0,I{i}-J{i})",
-                   f"=MAX(0,MIN(F{i},H{i}+K{i}))", verify, FV_URL.format(r["pid"])])
+                   f"=MAX(0,MIN(F{i},H{i}+K{i}))", verify, FV_URL.format(r["pid"]), r["ext"] or None])
         for c in (4, 5, 6, 8, 9, 10, 11, 12):
             ws.cell(i, c).number_format = MONEY
     last = hr + len(picks)
-    ws["E3"] = f"=SUM(L{hr + 1}:L{max(last, hr + 1)})"
+    rng = lambda c: f"{c}{hr + 1}:{c}{max(last, hr + 1)}"  # noqa: E731
+    ws["E3"] = f'=SUMIFS({rng("L")},{rng("O")},"")'
+    ws["J3"] = f'=SUM({rng("L")})-E3'
+    ws["J3"].number_format = MONEY
     ws["E3"].number_format = MONEY
     ws["E3"].font = Font(name=FONT, bold=True, size=12)
     if picks:
         add_table(ws, "FirmMoneyInTrust", hr, last, len(head))
     ws.freeze_panes = f"C{hr + 1}"
-    for c, w in zip("ABCDEFGHIJKLMN", [12, 34, 12, 14, 14, 14, 9, 13, 14, 14, 12, 15, 44, 18]):
+    for c, w in zip("ABCDEFGHIJKLMNO", [12, 34, 12, 14, 14, 14, 9, 13, 14, 14, 12, 15, 44, 18, 14]):
         ws.column_dimensions[c].width = w
     ws["A4"].alignment = Alignment(wrap_text=True, vertical="top")
-    ws.merge_cells("A4:N4")
+    ws.merge_cells("A4:O4")
     ws.row_dimensions[4].height = 45
 
 
@@ -298,6 +316,7 @@ def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in,
         ("Costs advanced, no Case Exp reimbursement from trust", "N", "QB shows costs advanced (or Filevine shows a Due-to-Firm expense disbursal) but no Case Exp check came out of trust and no write-off is recorded."),
         ("Cost reimbursement short of costs advanced", "N", "A Case Exp check was written, but for less than the costs advanced."),
         ("Settlement not fully run through trust", "M", "Filevine gross settlement exceeds everything paid out of trust for the case. Funds may still sit in trust, or part was paid outside trust."),
+        ("extenuating circumstance", "D", "Fee low or not yet taken, or costs short, but the case is probate, bankruptcy, minor, deceased or under an attorney lien (Filevine case name or Disbursed List notes). Fee is still waiting on release or was set by the court; not counted as a miss. Dollars = gross settlement."),
         ("Case Exp check from trust not found in cost account", "I", "Trust wrote a Case Exp check to the firm, but no matching credit landed in Advanced Client Costs."),
         ("No trust checks tagged to this case", "D", "Filevine shows a settlement but no trust check carries this case ID."),
         ("data cutoff", "D", f"Client paid within {RECENT_DAYS} days of the QuickBooks data cutoff; a missing fee or cost check may simply not be written yet. Recheck before acting."),

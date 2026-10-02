@@ -7,6 +7,8 @@ the logged Atty Fee, Case Exp and Postage with the trust checks to the firm.
 
 Usage: python3 scripts/disbursement_log_check.py <qb_full.xlsx> <out.xlsx> <Disbursements.xlsx> [more logs...]
 """
+import json
+import os
 import re
 import sys
 import unicodedata
@@ -19,7 +21,7 @@ from openpyxl.styles import Alignment, Font
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from build_cost_ledger import FONT, FV_URL, MONEY, add_table, style_header  # noqa: E402
 from qb_match import load_qb  # noqa: E402
-from trust_firm_audit import FEE_RE, COST_RE, FIRM, TRUST_BANK, case_id  # noqa: E402
+from trust_firm_audit import EXT_RE, FEE_RE, COST_RE, FIRM, TRUST_BANK, case_id  # noqa: E402
 
 TOL = 1.00          # dollars of rounding allowed before a difference is reported
 WINDOW = 60         # firm checks within this many days of the log's DSB date belong to that disbursement
@@ -58,6 +60,9 @@ def _d(v):
     return None
 
 
+SHORT_RE = re.compile(r"short|not taken|No trust checks")
+
+
 def read_log(path):
     ws = load_workbook(path, read_only=True, data_only=True)["Disbursed List"]
     rows = list(ws.iter_rows(values_only=True))
@@ -72,8 +77,18 @@ def read_log(path):
         out.append(dict(source=path.split("/")[-1], client=g("Client"), settled=num(g("Settlement $")),
                         fee=num(g("Atty Fee")), postage=num(g("Postage")), cost=num(g("Case Exp")),
                         attorney=g("Attorney"), cm=g("Case Manager"), market=g("Market"),
-                        dsb=_d(g("DSB Date")), set_date=_d(g("SET Date")), notes=g("Notes")))
+                        dsb=_d(g("DSB Date")), set_date=_d(g("SET Date")),
+                        notes="; ".join(str(v).strip() for v in (g("Notes"), g("DSB Notes")) if v)))
     return out
+
+
+def _unmatched_status(r, cutoff):
+    if r["dsb"] and r["dsb"] > cutoff:
+        return "Disbursed after the QuickBooks data cutoff"
+    ext = EXT_RE.search(f'{r["client"]} {r["notes"]}')
+    if ext:  # estate, trustee or court checks rarely carry the client's own name
+        return f"Pending or court-limited: extenuating circumstance ({ext.group(0).strip()}); no name match in trust (estate or trustee check)"
+    return "Client not found in trust near the DSB date"
 
 
 def main(qb_path, out_path, logs):
@@ -157,6 +172,10 @@ def main(qb_path, out_path, logs):
                 status.append("Postage short" if got["postage"] else "Postage not taken")
             if got["fee"] - want["fee"] > TOL or got["cost"] - want["cost"] > TOL:
                 status.append("Firm took more than the log shows")
+        ext = EXT_RE.search(" ".join(f'{r["client"]} {r["notes"]}' for r in grp))
+        if ext and any(SHORT_RE.search(x) for x in status):
+            status = [f"Pending or court-limited: extenuating circumstance ({ext.group(0).strip()})"] + \
+                [x for x in status if not SHORT_RE.search(x) and "recode" not in x]
         if status and any(r["ambiguous"] for r in grp):  # amounts that tie confirm the match
             status.append("Name on more than one case; confirm the match")
         results.append(dict(source=", ".join(sorted({r["source"][:4] for r in grp})), client=grp[0]["client"],
@@ -168,10 +187,11 @@ def main(qb_path, out_path, logs):
     for r in rows:
         if r["pid"] is None:
             results.append(dict(r, source=r["source"][:4], pid="", fee_qb=0.0, cost_qb=0.0, post_qb=0.0, other_qb=0.0,
-                                status="Disbursed after the QuickBooks data cutoff" if r["dsb"] and r["dsb"] > cutoff
-                                else "Client not found in trust near the DSB date"))
+                                status=_unmatched_status(r, cutoff)))
 
     write(out_path, results, subro)
+    with open(os.path.join(os.path.dirname(os.path.abspath(qb_path)), "log_notes.json"), "w") as f:
+        json.dump({str(r["pid"]): r["notes"] for r in results if r["pid"] and r["notes"]}, f)
     from collections import Counter
     c = Counter()
     for r in results:
@@ -279,16 +299,19 @@ def write(out_path, results, subro=()):
         ("Client not found in trust", "E", "G", "Log name not found in the trust ledger near the DSB date (name spelling, or paid outside trust)."),
         ("after the QuickBooks data cutoff", "F", "G", "DSB date is after the QuickBooks export ends; recheck with a newer export."),
         ("Firm took more than the log", "F", "G", "Trust paid the firm more than the log shows. Usually a log entry error; confirm."),
+        ("extenuating circumstance", "F", "G", "Probate, bankruptcy, minor, deceased or attorney lien noted on the log. Fee is still waiting on "
+         "court or trustee release; not counted as a miss. Follow up on aging."),
     ]
     for i, (label, a, b, note) in enumerate(checks, start=4):
         crit = f'Exceptions!$T$2:$T${n},"*{label}*"'
         sm.append([label, f"=COUNTIFS({crit})", f"=SUMIFS(Exceptions!${a}$2:${a}${n},{crit})",
-                   f"=SUMIFS(Exceptions!${b}$2:${b}${n},{crit})", f"=MAX(0,C{i}-D{i})", note])
+                   f"=SUMIFS(Exceptions!${b}$2:${b}${n},{crit})", None if label.startswith("extenuating") else f"=MAX(0,C{i}-D{i})", note])
         for c in (3, 4, 5):
             sm.cell(i, c).number_format = MONEY
     r0 = 4 + len(checks) + 1
     sm.cell(r0, 1, "Cases on the logs (matched to trust)")
-    sm.cell(r0, 2, f'=COUNTIF(\'All Log Rows\'!$T$2:$T${n},"<>Client not found*")')
+    sm.cell(r0, 2, f'=COUNTA(\'All Log Rows\'!$T$2:$T${n})-COUNTIF(\'All Log Rows\'!$T$2:$T${n},"Client not found*")'
+                f'-COUNTIF(\'All Log Rows\'!$T$2:$T${n},"*no name match*")')
     sm.cell(r0 + 1, 1, "Cases that tie exactly")
     sm.cell(r0 + 1, 2, f'=COUNTIF(\'All Log Rows\'!$T$2:$T${n},"Ties")')
     notes = ["Method: each Disbursed List row is matched to its Filevine case by client name in the trust ledger, nearest the DSB date. "
