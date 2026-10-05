@@ -20,8 +20,17 @@ Usage:
   python scripts/filevine_backup.py projects          # every project, de-identified (no client names)
   python scripts/filevine_backup.py projects --full   # every project, all fields (contains PII)
   python scripts/filevine_backup.py marketing --since 2024-10-01   # marketing source + outcome per PI case
-  python scripts/filevine_backup.py case 15148094     # one case: contacts, notes, tasks, deadlines, forms, collections, docs list
+  python scripts/filevine_backup.py case 15148094     # one case: contacts, notes/tasks/emails, deadlines, every tab, docs list
+  python scripts/filevine_backup.py cases             # EVERY case as above, one JSON file each (contains PII)
+  python scripts/filevine_backup.py cases --since 2025-01-01 --workers 6   # only cases created since a date
   python scripts/filevine_backup.py all               # config + projects (de-identified)
+
+The cases run is resumable: stop it any time and run the same command again;
+cases already saved in filevine_backup/cases/ are skipped. Failures are logged
+to filevine_backup/cases/_errors.log and retried on the next run. Expect roughly
+45 API calls per case, so all ~69,000 cases takes a day or more; raise --workers
+only if Filevine isn't returning rate-limit errors. Document files themselves
+are not downloaded, only the list of documents on each case.
 """
 import argparse
 import csv
@@ -29,7 +38,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +64,7 @@ class Client:
         self.token_exp = 0
         self.org_id = os.environ.get("FV_ORG_ID")
         self.user_id = None
+        self._lock = threading.Lock()
         self._login()
 
     def _login(self):
@@ -79,7 +91,9 @@ class Client:
 
     def _request(self, method, path, params=None, auth_only=False):
         if time.time() > self.token_exp and not auth_only:
-            self._login()
+            with self._lock:
+                if time.time() > self.token_exp:
+                    self._login()
         url = API_BASE + path
         if params:
             url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
@@ -241,42 +255,93 @@ def export_marketing(c, since):
     print(f"  wrote {path} ({n} cases)")
 
 
-def export_case(c, pid):
-    print(f"Case {pid} ...")
+CASE_LISTS = [
+    ("contacts", "/projects/{pid}/contacts", {}),
+    ("notes", "/projects/{pid}/notes", {}),  # all activity: notes, tasks, emails, texts, calls
+    ("appointments", "/projects/{pid}/appointments", {}),
+    ("deadlines", "/projects/{pid}/deadlines", {}),
+    ("deadlinechains", "/projects/{pid}/deadlinechains", {}),
+    ("documents", "/documents", {"projectId": "{pid}"}),
+]
+_sections_cache = {}
+_sections_lock = threading.Lock()
+
+
+def type_sections(c, tid):
+    with _sections_lock:
+        if tid not in _sections_cache:
+            _sections_cache[tid] = list(c.paged(f"/projecttypes/{tid}/sections"))
+        return _sections_cache[tid]
+
+
+def case_record(c, pid):
+    """Everything on one case except the document files themselves."""
     out = {"project": c.get(f"/projects/{pid}")}
-    for key, path in [
-        ("contacts", f"/projects/{pid}/contacts"),
-        ("notes", f"/projects/{pid}/notes"),
-        ("tasks", f"/projects/{pid}/tasks"),
-        ("emails", f"/projects/{pid}/emails"),
-        ("appointments", f"/projects/{pid}/appointments"),
-        ("deadlines", f"/projects/{pid}/deadlines"),
-        ("deadlinechains", f"/projects/{pid}/deadlinechains"),
-        ("documents", "/documents"),
-    ]:
+    for key, path, params in CASE_LISTS:
         try:
-            params = {"projectId": pid} if key == "documents" else {}
-            out[key] = list(c.paged(path, **params))
+            out[key] = list(c.paged(path.format(pid=pid), **{k: v.format(pid=pid) for k, v in params.items()}))
         except urllib.error.HTTPError as e:
             out[key] = {"error": e.code}
-    tid = native(out["project"]["projectTypeId"])
     out["sections"] = {}
-    for s in c.paged(f"/projecttypes/{tid}/sections"):
+    for s in type_sections(c, native(out["project"]["projectTypeId"])):
         sel = s["sectionSelector"]
         try:
             out["sections"][sel] = (list(c.paged(f"/projects/{pid}/collections/{sel}"))
                                     if s.get("isCollection") else c.get(f"/projects/{pid}/forms/{sel}"))
         except urllib.error.HTTPError as e:
             out["sections"][sel] = {"error": e.code}
-    save(f"case_{pid}.json", out)
+    return out
+
+
+def export_case(c, pid):
+    print(f"Case {pid} ...")
+    save(f"case_{pid}.json", case_record(c, pid))
+
+
+def export_cases(c, since=None, workers=4):
+    folder = os.path.join(OUT, "cases")
+    os.makedirs(folder, exist_ok=True)
+    err_log = os.path.join(folder, "_errors.log")
+    print(f"All cases{' since ' + since if since else ''} -> {folder}/ ({workers} workers)")
+    pids = [native(p["projectId"]) for p in c.paged(
+        "/projects", requestedFields="projectId", createdSince=since, sortBy="createdDate", orderBy="asc")]
+    todo = [pid for pid in pids if not os.path.exists(os.path.join(folder, f"{pid}.json"))]
+    print(f"  {len(pids)} cases found, {len(pids) - len(todo)} already saved, {len(todo)} to go")
+
+    def one(pid):
+        rec = case_record(c, pid)
+        path = os.path.join(folder, f"{pid}.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump(rec, f, default=str)
+        os.replace(path + ".tmp", path)  # only complete files count as saved
+
+    done = failed = 0
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(one, pid): pid for pid in todo}
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+                done += 1
+            except Exception as e:  # keep going; failed cases retry on the next run
+                failed += 1
+                with open(err_log, "a") as f:
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{futures[fut]}\t{e!r}\n")
+            n = done + failed
+            if n % 100 == 0 or n == len(todo):
+                rate = n / max(time.time() - started, 1)
+                left = (len(todo) - n) / rate / 3600 if rate else 0
+                print(f"  {n}/{len(todo)} ({failed} failed), about {left:.1f} h left")
+    print(f"  done: {done} saved, {failed} failed" + (f" (see {err_log}; rerun to retry)" if failed else ""))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("what", choices=["config", "projects", "marketing", "case", "all"])
+    ap.add_argument("what", choices=["config", "projects", "marketing", "case", "cases", "all"])
     ap.add_argument("project_id", nargs="?")
     ap.add_argument("--full", action="store_true", help="projects: keep every field, including client names")
-    ap.add_argument("--since", default="2024-10-01", help="marketing: first created date (YYYY-MM-DD)")
+    ap.add_argument("--since", help="marketing/cases: first created date, YYYY-MM-DD (marketing defaults to 2024-10-01)")
+    ap.add_argument("--workers", type=int, default=4, help="cases: parallel requests (default 4)")
     a = ap.parse_args()
     c = Client()
     print(f"Org {c.org_id}, user {c.user_id}, output -> {OUT}/")
@@ -285,7 +350,9 @@ def main():
     if a.what in ("projects", "all"):
         export_projects(c, full=a.full)
     if a.what == "marketing":
-        export_marketing(c, a.since)
+        export_marketing(c, a.since or "2024-10-01")
+    if a.what == "cases":
+        export_cases(c, a.since, a.workers)
     if a.what == "case":
         if not a.project_id:
             sys.exit("case needs a project id")
