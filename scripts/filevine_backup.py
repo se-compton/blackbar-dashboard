@@ -10,7 +10,9 @@ so keep it on firm-controlled storage. Never commit it; this repo is public.
 Setup (Filevine org admin):
   1. In Filevine, create a Personal Access Token plus API client ID/secret
      (Filevine Help Center: "Authenticate Requests to the API Gateway").
-  2. export FV_PAT=...  FV_CLIENT_ID=...  FV_CLIENT_SECRET=...
+  2. Run any command below. The script asks for the token, client ID and
+     client secret (typing is hidden). To skip the prompts, set FV_PAT,
+     FV_CLIENT_ID and FV_CLIENT_SECRET in the environment instead.
      Optional: FV_ORG_ID (defaults to the first org on the token),
                FV_IDENTITY_URL, FV_API_BASE, FV_SCOPE (see defaults below;
                confirm against the current Filevine developer docs).
@@ -34,6 +36,7 @@ are not downloaded, only the list of documents on each case.
 """
 import argparse
 import csv
+import getpass
 import json
 import os
 import re
@@ -57,9 +60,15 @@ PAGE = 1000
 
 class Client:
     def __init__(self):
-        for var in ("FV_PAT", "FV_CLIENT_ID", "FV_CLIENT_SECRET"):
-            if not os.environ.get(var):
-                sys.exit(f"Missing env var {var}. See the header of this file.")
+        for var, label in (("FV_PAT", "Filevine personal access token"),
+                           ("FV_CLIENT_ID", "Filevine client ID"),
+                           ("FV_CLIENT_SECRET", "Filevine client secret")):
+            val = os.environ.get(var, "").strip()
+            if not val or set(val) <= {"."}:  # unset, or the "..." placeholder from the instructions
+                val = getpass.getpass(f"{label} (hidden): ").strip()
+                if not val:
+                    sys.exit(f"No {label} entered.")
+                os.environ[var] = val
         self.token = None
         self.token_exp = 0
         self.org_id = os.environ.get("FV_ORG_ID")
@@ -79,8 +88,13 @@ class Client:
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
         })
-        with urllib.request.urlopen(req) as r:
-            tok = json.load(r)
+        try:
+            with urllib.request.urlopen(req) as r:
+                tok = json.load(r)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            sys.exit(f"Filevine login failed (HTTP {e.code}) at {IDENTITY_URL}\n  Filevine said: {detail or '(no detail)'}\n"
+                     "  Check that the token, client ID and client secret are the real values, typed exactly.")
         self.token = tok["access_token"]
         # Tokens last ~20 minutes; refresh a little early.
         self.token_exp = time.time() + int(tok.get("expires_in", 1200)) - 120
