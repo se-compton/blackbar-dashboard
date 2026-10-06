@@ -39,6 +39,13 @@ from build_cost_ledger import FONT, FV_URL, MONEY, SCOPE_START, add_table, dispo
 from qb_match import assign_direct, enrich_from_ledger, load_qb, split_general_ledger  # noqa: E402
 
 TRUST_BANK = "Hostilo Trust"
+
+
+def is_trust_payout_acct(acct):
+    """QuickBooks registers that write checks on the trust bank account (BofA 1206): the main trust register,
+    Deluxe e-checks (VV numbers), and the office DSB registers added in 2026."""
+    acct = acct or ""
+    return acct == TRUST_BANK or acct == "E-checks" or acct.endswith("DSB Account")
 COST_ACCOUNT = "Advanced Client Costs"
 FEE_INCOME = "Disbursement Income"
 FIRM = "Hostilo, LLC"
@@ -89,6 +96,10 @@ def main(data_dir, qb_path, out_path, as_of):
     if os.path.exists(os.path.join(data_dir, "log_notes.json")):
         with open(os.path.join(data_dir, "log_notes.json")) as f:
             log_notes = json.load(f)
+    bank = {}  # pid -> {clearing result: firm check dollars}, written by bank_clearing.py when it has been run
+    if os.path.exists(os.path.join(data_dir, "bank_status.json")):
+        with open(os.path.join(data_dir, "bank_status.json")) as f:
+            bank = json.load(f)["cases"]
     lines = load_qb(qb_path)
     start = date.fromisoformat(SCOPE_START)
 
@@ -100,7 +111,7 @@ def main(data_dir, qb_path, out_path, as_of):
     client_date, cutoff = {}, date(2000, 1, 1)
     for ln in lines:
         acct, memo, name, amt = ln["acct"] or "", ln["memo"], ln["name"], ln["amount"]
-        if acct == TRUST_BANK and ln["type"] in ("Check", "Expense") and amt < 0:
+        if is_trust_payout_acct(acct) and ln["type"] in ("Check", "Expense") and amt < 0:
             paid = -amt
             to_firm = FIRM in name
             if to_firm and FEE_RE.search(memo) and ln["date"] >= start:
@@ -184,7 +195,7 @@ def main(data_dir, qb_path, out_path, as_of):
         ext = ext.group(0).strip().title() if ext else ""
         if ext and any(k in f for f in flags for k in PENDING_ON):
             flags = [f"Pending or court-limited: extenuating circumstance ({ext})"] + [f for f in flags if not any(k in f for k in PENDING_ON)]
-        row = dict(pid=pid, name=case["projectName"], ext=ext, ddate=ddate, paid_on=paid_on.isoformat() if paid_on else None, settled=settled, client=client, third=third,
+        row = dict(pid=pid, name=case["projectName"], ext=ext, bank=bank_label(bank.get(str(pid)), bool(bank)), ddate=ddate, paid_on=paid_on.isoformat() if paid_on else None, settled=settled, client=client, third=third,
                    fee=fee, fee_pct=(fee / settled) if settled else None, cost=cost, postage=t.get("postage", 0.0),
                    firm_other=t.get("firm_other", 0.0), out_total=out_total, cost_adv=cost_adv.get(pid, 0.0),
                    fv_logged=fv_logged, fv_disb=fv_disb, landed=cost_landed.get(pid, 0.0), writeoff=writeoff,
@@ -205,7 +216,8 @@ HEAD = ["Filevine Project ID", "Case Name", "Settlement Date", "FV Gross Settlem
         "Paid to Third Parties (trust)", "Atty Fee to Firm (trust)", "Fee % of Settlement", "Case Exp to Firm (trust)",
         "Postage to Firm (trust)", "Other to Firm (trust)", "Total Paid Out of Trust", "Settlement minus Paid Out",
         "QB Costs Advanced (cost acct)", "FV Costs Logged", "FV Due-to-Firm Expense Disbursal",
-        "Case Exp Landed in Cost Acct", "FV Write-off (FRD/REJ)", "Exceptions", "Filevine Link", "Last Client Payment (trust)", "Priority", "Next Step"]
+        "Case Exp Landed in Cost Acct", "FV Write-off (FRD/REJ)", "Exceptions", "Filevine Link", "Last Client Payment (trust)", "Priority", "Next Step",
+        "Bank: Firm Checks Cleared?"]
 
 
 ACTIONS = [  # (flag text, priority, next step); first match sets the priority
@@ -221,6 +233,25 @@ ACTIONS = [  # (flag text, priority, next step); first match sets the priority
 ]
 
 
+def bank_label(st, have_bank):
+    """One-line bank clearing result for the firm's trust checks on a case (see bank_clearing.py)."""
+    if not have_bank:
+        return None
+    if not st:
+        return "No firm checks"
+    def amt(prefix):
+        return sum(v for k, v in st.items() if k.startswith(prefix))
+    stuck = amt("Not cleared")
+    if stuck > 0:
+        return f"No: ${stuck:,.2f} not cleared"
+    gap = amt("Can't confirm")
+    if gap > 0:
+        return f"Feed gap: ${gap:,.2f} unconfirmed"
+    if amt("Cleared") > 0:
+        return "Yes" if amt("Before bank data") == 0 else "Yes (older checks before bank data)"
+    return "Before bank data"
+
+
 def triage(flags):
     for key, pri, step in ACTIONS:
         if key in flags:
@@ -232,7 +263,8 @@ def triage(flags):
 def case_row(ws, i, r):
     ws.append([r["pid"], r["name"], r["ddate"], r["settled"], r["client"], r["third"], r["fee"], None, r["cost"],
                r["postage"], r["firm_other"], r["out_total"], None, r["cost_adv"], r["fv_logged"], r["fv_disb"],
-               r["landed"], "Yes" if r["writeoff"] else "", r["flags"], FV_URL.format(r["pid"]), r["paid_on"]] + list(triage(r["flags"])))
+               r["landed"], "Yes" if r["writeoff"] else "", r["flags"], FV_URL.format(r["pid"]), r["paid_on"]] + list(triage(r["flags"]))
+              + [r["bank"]])
     ws.cell(i, 8, f'=IF(D{i}=0,"",G{i}/D{i})').number_format = "0.0%"
     ws.cell(i, 13, f"=D{i}-L{i}")
     for c in (4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17):
@@ -267,7 +299,7 @@ def firm_money_tab(wb, rows):
                 "deposits are not tagged by case. Confirm each against the client trust ledger card and closing statement before moving funds.")
     head = ["Filevine Project ID", "Case Name", "Last Client Payment", "Gross Settlement", "Paid Out of Trust",
             "Est. Left in Trust", "No Fee Taken", "Est. Fee Owed", "Costs Advanced", "Cost Reimbursed (trust)",
-            "Costs Owed", "Likely Firm $ in Trust", "Verify", "Filevine Link", "Pending Reason"]
+            "Costs Owed", "Likely Firm $ in Trust", "Verify", "Filevine Link", "Pending Reason", "Bank: Firm Checks Cleared?"]
     hr = 6
     for c, h in enumerate(head, 1):
         ws.cell(hr, c, h)
@@ -277,7 +309,7 @@ def firm_money_tab(wb, rows):
         ws.append([r["pid"], r["name"], r["paid_on"], r["settled"], r["out_total"], f"=D{i}-E{i}",
                    "Yes" if no_fee else "No", f'=IF(G{i}="Yes",D{i}*$E$2,0)', costs_expected, r["cost"],
                    0 if r["writeoff"] else f"=MAX(0,I{i}-J{i})",
-                   f"=MAX(0,MIN(F{i},H{i}+K{i}))", verify, FV_URL.format(r["pid"]), r["ext"] or None])
+                   f"=MAX(0,MIN(F{i},H{i}+K{i}))", verify, FV_URL.format(r["pid"]), r["ext"] or None, r["bank"]])
         for c in (4, 5, 6, 8, 9, 10, 11, 12):
             ws.cell(i, c).number_format = MONEY
     last = hr + len(picks)
@@ -290,10 +322,10 @@ def firm_money_tab(wb, rows):
     if picks:
         add_table(ws, "FirmMoneyInTrust", hr, last, len(head))
     ws.freeze_panes = f"C{hr + 1}"
-    for c, w in zip("ABCDEFGHIJKLMNO", [12, 34, 12, 14, 14, 14, 9, 13, 14, 14, 12, 15, 44, 18, 14]):
+    for c, w in zip("ABCDEFGHIJKLMNOP", [12, 34, 12, 14, 14, 14, 9, 13, 14, 14, 12, 15, 44, 18, 14, 26]):
         ws.column_dimensions[c].width = w
     ws["A4"].alignment = Alignment(wrap_text=True, vertical="top")
-    ws.merge_cells("A4:O4")
+    ws.merge_cells("A4:P4")
     ws.row_dimensions[4].height = 45
 
 
@@ -359,7 +391,7 @@ def write_workbook(out_path, as_of, rows, flagged, trust_lines, fee_out, fee_in,
         if data:
             add_table(sh, title.replace(" ", ""), 1, len(data) + 1, len(HEAD))
         sh.freeze_panes = "C2"
-        for c, w in zip("ABCDEFGHIJKLMNOPQRSTUVW", [12, 34, 12] + [14] * 15 + [60, 18, 12, 9, 70]):
+        for c, w in zip("ABCDEFGHIJKLMNOPQRSTUVWX", [12, 34, 12] + [14] * 15 + [60, 18, 12, 9, 70, 26]):
             sh.column_dimensions[c].width = w
 
     firm_money_tab(wb, rows)

@@ -21,7 +21,7 @@ from openpyxl.styles import Alignment, Font
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from build_cost_ledger import FONT, FV_URL, MONEY, add_table, style_header  # noqa: E402
 from qb_match import load_qb  # noqa: E402
-from trust_firm_audit import EXT_RE, FEE_RE, COST_RE, FIRM, TRUST_BANK, case_id  # noqa: E402
+from trust_firm_audit import EXT_RE, FEE_RE, COST_RE, FIRM, case_id, is_trust_payout_acct  # noqa: E402
 
 TOL = 1.00          # dollars of rounding allowed before a difference is reported
 WINDOW = 60         # firm checks within this many days of the log's DSB date belong to that disbursement
@@ -97,7 +97,7 @@ def main(qb_path, out_path, logs):
     cutoff = date(2000, 1, 1)
     firm = defaultdict(list)          # pid -> [(date, bucket, amount)] checks written to the firm
     for ln in load_qb(qb_path):
-        if (ln["acct"] or "") != TRUST_BANK or ln["amount"] >= 0:
+        if not is_trust_payout_acct(ln["acct"]) or ln["amount"] >= 0:
             continue
         pid = case_id(ln["memo"], ln["name"])
         if not pid:
